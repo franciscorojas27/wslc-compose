@@ -2,13 +2,14 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"wslc-compose/internal/config"
 )
 
-func CreateVolume(ctx context.Context, name string, vol config.Volume) error {
+func CreateVolume(ctx context.Context, name string, vol config.Volume) (string, error) {
 	if vol.External {
-		return nil
+		return name, nil
 	}
 
 	args := []string{"volume", "create"}
@@ -25,25 +26,27 @@ func CreateVolume(ctx context.Context, name string, vol config.Volume) error {
 
 	res, err := RunWSLC(ctx, args...)
 	if err != nil {
-		return err
+		if errors.Is(err, ErrAlreadyExists) {
+			return name, nil
+		}
+		return "", fmt.Errorf("Resource %s was not created: %w", name, err)
 	}
-	if res != "" {
-		fmt.Println(res)
-	}
-	return nil
+
+	return res, nil
 }
 
-func RemoveVolume(ctx context.Context, name string, vol config.Volume) error {
+func RemoveVolume(ctx context.Context, name string, vol config.Volume) (string, error) {
 	if vol.External {
-		return nil
+		return name, nil
 	}
 
 	res, err := RunWSLC(ctx, "volume", "rm", name)
 	if err != nil {
-		return err
+		if errors.Is(err, ErrNotFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("Resource %s was not deleted: %w", name, err)
 	}
-	if res != "" {
-		fmt.Println(res)
-	}
-	return nil
+
+	return res, nil
 }
