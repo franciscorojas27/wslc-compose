@@ -97,9 +97,9 @@ services:
 
 networks:
   frontend:
-    driver: nat
+    driver: bridge
   backend:
-    driver: nat
+    driver: bridge
     labels:
       tier: internal
   red_compartida:

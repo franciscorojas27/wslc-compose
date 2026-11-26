@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"wslc-compose/internal/config"
+	"wslc-compose/internal/runtime"
 
 	"github.com/spf13/cobra"
 )
@@ -14,22 +16,19 @@ var upCmd = &cobra.Command{
 	Short: "Crea y levanta los servicios definidos en el archivo compose",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load(composeFile)
+		ctx := context.Background()
 		if err != nil {
 			return err
 		}
 
-		for name, vol := range cfg.Volumes {
-			fmt.Printf("Volumen ' %s ' en creacion \n", name)
-			fmt.Printf("   External ' %t ' \n", vol.External)
-			if vol.Driver != "" {
-				fmt.Printf("   Driver ' %s ' \n", vol.Driver)
-			}
-			if len(vol.Labels) > 0 {
-				for name, label := range vol.Labels {
-					fmt.Printf("   Label ' %s = %s' en creacion \n", name, label)
+		if len(cfg.Networks) > 0 {
+			for name, net := range cfg.Networks {
+				text, err := runtime.CreateNetwork(ctx, name, net)
+				if err != nil {
+					return err
 				}
+				fmt.Println(text)
 			}
-
 		}
 
 		return nil
