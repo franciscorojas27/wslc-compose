@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"wslc-compose/internal/config"
 
@@ -19,12 +18,20 @@ var upCmd = &cobra.Command{
 			return err
 		}
 
-		dump, err := json.MarshalIndent(cfg, "", "  ")
-		if err != nil {
-			return err
+		for name, vol := range cfg.Volumes {
+			fmt.Printf("Volumen ' %s ' en creacion \n", name)
+			fmt.Printf("   External ' %t ' \n", vol.External)
+			if vol.Driver != "" {
+				fmt.Printf("   Driver ' %s ' \n", vol.Driver)
+			}
+			if len(vol.Labels) > 0 {
+				for name, label := range vol.Labels {
+					fmt.Printf("   Label ' %s = %s' en creacion \n", name, label)
+				}
+			}
+
 		}
 
-		fmt.Printf("Estructura completa cargada (detach=%v):\n%s\n", detach, string(dump))
 		return nil
 	},
 }

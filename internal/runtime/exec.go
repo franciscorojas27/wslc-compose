@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-func WSLC(ctx context.Context, args ...string) (string, error) {
+func RunWSLC(ctx context.Context, args ...string) (string, error) {
 	out, err := exec.CommandContext(ctx, "wslc.exe", args...).CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {

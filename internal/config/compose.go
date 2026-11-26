@@ -18,9 +18,10 @@ type Network struct {
 	Labels   map[string]string `yaml:"labels"`
 }
 type Volume struct {
-	Driver   string `yaml:"driver"`
-	External bool   `yaml:"external"`
-	Name     string `yaml:"name"`
+	Driver   string            `yaml:"driver"`
+	External bool              `yaml:"external"`
+	Labels   map[string]string `yaml:"labels"`
+	Name     string            `yaml:"name"`
 }
 
 type Service struct {
