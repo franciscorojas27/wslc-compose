@@ -1,6 +1,3 @@
-/*
-Copyright © 2026 NAME HERE <EMAIL ADDRESS>
-*/
 package cmd
 
 import (
@@ -9,21 +6,25 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var Version = "dev"
+var (
+	version     = "dev"
+	composeFile string
+)
 
 var rootCmd = &cobra.Command{
-	Use:     "wslc-compose",
-	Short:   "Orquestador de contenedores Windows usando wslc.exe",
-	Version: Version,
+	Use:          "wslc-compose",
+	Short:        "Orquestador de contenedores Windows usando wslc.exe",
+	Version:      version,
+	SilenceUsage: true,
 }
 
 func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
+	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
 func init() {
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	defaultFile := os.Getenv("COMPOSE_FILE")
+	rootCmd.PersistentFlags().StringVarP(&composeFile, "file", "f", defaultFile, "Path to the compose file")
 }

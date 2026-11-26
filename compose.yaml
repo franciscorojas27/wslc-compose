@@ -7,13 +7,14 @@
 # You can add other services your application may depend on here, such as a
 # database or a cache. For examples, see the Awesome Compose repository:
 # https://github.com/docker/awesome-compose
-services:
-  server:
-    build:
-      context: .
-      target: final
-    ports:
-      - 5500:5500
+# services:
+
+#   server:
+#     build:
+#       context: .
+#       target: final
+#     ports:
+#       - 5500:5500
 
 # The commented out section below is an example of how to define a PostgreSQL
 # database that your application can use. `depends_on` tells Docker Compose to
@@ -48,3 +49,63 @@ services:
 #   db-password:
 #     file: db/password.txt
 
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf
+    networks:
+      - frontend
+    depends_on:
+      - api
+
+  api:
+    image: golang:1.27-alpine
+    ports:
+      - "3000:3000"
+    environment:
+      APP_ENV: production
+      DB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./config:/app/config
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: appdb
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - cache_data:/data
+    networks:
+      - backend
+
+networks:
+  frontend:
+    driver: nat
+  backend:
+    driver: nat
+    labels:
+      tier: internal
+  red_compartida:
+    external: true
+
+volumes:
+  db_data:
+  cache_data:
+    driver: local
