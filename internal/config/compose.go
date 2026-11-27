@@ -15,21 +15,23 @@ import (
 const envPassthroughSentinel = "\x00__WSLC_COMPOSE_ENV_LOOKUP__"
 
 type LoadOptions struct {
-	Files       []string
-	ProjectName string
-	EnvFile     string
-	Profiles    []string
+	Files            []string
+	ProjectName      string
+	EnvFile          string
+	Profiles         []string
+	ExplicitServices []string
 }
 
 type ComposeFile struct {
-	Name        string             `yaml:"name,omitempty"`
-	Services    map[string]Service `yaml:"services"`
-	Networks    map[string]Network `yaml:"networks,omitempty"`
-	Volumes     map[string]Volume  `yaml:"volumes,omitempty"`
-	AllServices map[string]Service `yaml:"-"`
-	BaseDir     string             `yaml:"-"`
-	ProjectDir  string             `yaml:"-"`
-	FilePath    string             `yaml:"-"`
+	Name           string             `yaml:"name,omitempty"`
+	Services       map[string]Service `yaml:"services"`
+	Networks       map[string]Network `yaml:"networks,omitempty"`
+	Volumes        map[string]Volume  `yaml:"volumes,omitempty"`
+	AllServices    map[string]Service `yaml:"-"`
+	ActiveProfiles []string           `yaml:"-"`
+	BaseDir        string             `yaml:"-"`
+	ProjectDir     string             `yaml:"-"`
+	FilePath       string             `yaml:"-"`
 }
 
 type IPAMConfig struct {
@@ -179,6 +181,16 @@ func Load(explicitPath string, opts ...LoadOptions) (ComposeFile, error) {
 			resolvedMounts := make(VolumeMounts, len(svc.Volumes))
 			copy(resolvedMounts, svc.Volumes)
 			for i, mount := range resolvedMounts {
+				if mount.Type == "" {
+					if mount.Source == "" {
+						mount.Type = "volume"
+					} else if _, isNamed := cfg.Volumes[mount.Source]; isNamed {
+						mount.Type = "volume"
+					} else {
+						mount.Type = inferMountType(mount.Source)
+					}
+					resolvedMounts[i].Type = mount.Type
+				}
 				if mount.Source == "" {
 					continue
 				}
@@ -216,8 +228,9 @@ func Load(explicitPath string, opts ...LoadOptions) (ComposeFile, error) {
 	cfg.AllServices = allServices
 
 	activeProfiles := collectActiveProfiles(opt.Profiles, lookup)
-	if len(activeProfiles) > 0 {
-		cfg = cfg.FilterByProfiles(activeProfiles, nil)
+	cfg.ActiveProfiles = activeProfiles
+	if len(activeProfiles) > 0 || len(opt.ExplicitServices) > 0 {
+		cfg = cfg.FilterByProfiles(activeProfiles, opt.ExplicitServices)
 	}
 
 	return cfg, nil
@@ -801,7 +814,11 @@ func (c ComposeFile) VolumeName(volumeKey string) string {
 }
 
 func (c ComposeFile) FilterByProfiles(activeProfiles []string, explicitServices []string) ComposeFile {
-	if len(c.Services) == 0 {
+	source := c.Services
+	if len(c.AllServices) > 0 {
+		source = c.AllServices
+	}
+	if len(source) == 0 {
 		return c
 	}
 
@@ -825,14 +842,14 @@ func (c ComposeFile) FilterByProfiles(activeProfiles []string, explicitServices 
 		explicitSet[s] = true
 	}
 
-	included := make(map[string]bool, len(c.Services))
-	for name, svc := range c.Services {
+	included := make(map[string]bool, len(source))
+	for name, svc := range source {
 		if wildcard || len(svc.Profiles) == 0 || explicitSet[name] {
 			included[name] = true
 			continue
 		}
 		for _, p := range svc.Profiles {
-			if profileSet[p] {
+			if profileSet[strings.TrimSpace(p)] {
 				included[name] = true
 				break
 			}
@@ -843,12 +860,12 @@ func (c ComposeFile) FilterByProfiles(activeProfiles []string, explicitServices 
 	for changed {
 		changed = false
 		for name := range included {
-			svc, ok := c.Services[name]
+			svc, ok := source[name]
 			if !ok {
 				continue
 			}
 			for dep := range svc.DependsOn {
-				if _, exists := c.Services[dep]; exists && !included[dep] {
+				if _, exists := source[dep]; exists && !included[dep] {
 					included[dep] = true
 					changed = true
 				}
@@ -858,12 +875,21 @@ func (c ComposeFile) FilterByProfiles(activeProfiles []string, explicitServices 
 
 	filtered := make(map[string]Service, len(included))
 	for name := range included {
-		filtered[name] = c.Services[name]
+		filtered[name] = source[name]
 	}
 
 	out := c
 	if len(out.AllServices) == 0 {
-		out.AllServices = c.Services
+		all := make(map[string]Service, len(source))
+		for name, svc := range source {
+			all[name] = svc
+		}
+		out.AllServices = all
+	}
+	if len(activeProfiles) > 0 {
+		out.ActiveProfiles = append([]string(nil), activeProfiles...)
+	} else {
+		out.ActiveProfiles = nil
 	}
 	out.Services = filtered
 	return out
@@ -895,7 +921,14 @@ func ParseDurationSeconds(raw string) (int, bool) {
 		return secs, true
 	}
 	if d, err := time.ParseDuration(trimmed); err == nil && d >= 0 {
-		return int(d.Seconds()), true
+		if d == 0 {
+			return 0, true
+		}
+		secs := int(d / time.Second)
+		if d%time.Second != 0 {
+			secs++
+		}
+		return secs, true
 	}
 	return 0, false
 }

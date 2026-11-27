@@ -28,6 +28,7 @@ var downCmd = &cobra.Command{
 			Timeout:       downTimeout,
 			HasTimeout:    cmd.Flags().Changed("timeout"),
 			RMI:           downRMI,
+			Profiles:      cfg.ActiveProfiles,
 		})
 	},
 }

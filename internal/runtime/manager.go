@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 	"wslc-compose/internal/config"
 
 	"golang.org/x/sync/errgroup"
@@ -34,6 +33,7 @@ type DownOptions struct {
 	Timeout       int
 	HasTimeout    bool
 	RMI           string
+	Profiles      []string
 }
 
 type PullOptions struct {
@@ -139,7 +139,7 @@ func Up(ctx context.Context, cfg config.ComposeFile, opts ...UpOptions) error {
 			orphanMu   sync.Mutex
 			orphanErrs []error
 		)
-		removeOrphanContainers(ctx, orphans, ui, func(err error) {
+		removeOrphanContainers(ctx, orphans, false, ui, func(err error) {
 			if err == nil {
 				return
 			}
@@ -217,7 +217,8 @@ func attachAndWaitForeground(ctx context.Context, cfg config.ComposeFile, servic
 	}
 
 	fmt.Fprintln(out, "Gracefully stopping...")
-	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	stopTimeout := computeShutdownTimeout(cfg, floors, nil)
+	stopCtx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 	defer cancel()
 
 	stopErr := stopFloors(stopCtx, cfg, floors, -1)
@@ -291,12 +292,20 @@ func Down(ctx context.Context, cfg config.ComposeFile, opts ...DownOptions) erro
 		return fmt.Errorf("invalid --rmi value %q: must be \"all\" or \"local\"", opt.RMI)
 	}
 
-	floors, err := BuildFloors(cfg.Services)
+	downCfg := cfg
+	if len(opt.Profiles) > 0 && len(downCfg.ActiveProfiles) == 0 {
+		downCfg.ActiveProfiles = append([]string(nil), opt.Profiles...)
+	}
+	if len(downCfg.ActiveProfiles) == 0 && len(downCfg.AllServices) > len(downCfg.Services) {
+		downCfg.Services = downCfg.AllServices
+	}
+
+	floors, err := BuildFloors(downCfg.Services)
 	if err != nil {
 		return err
 	}
 
-	effectiveCfg := withDefaultNetwork(cfg, cfg.Services)
+	effectiveCfg := withDefaultNetwork(downCfg, downCfg.Services)
 
 	var orphans []ContainerInfo
 	if opt.RemoveOrphans {
@@ -362,7 +371,7 @@ func Down(ctx context.Context, cfg config.ComposeFile, opts ...DownOptions) erro
 						return
 					}
 				}
-				if err := StopAndRemoveContainer(ctx, containerName); err != nil {
+				if err := RemoveContainer(ctx, containerName, true, opt.RemoveVolumes); err != nil {
 					ui.setFailed(id, "Error")
 					recordErr(err)
 					return
@@ -374,7 +383,7 @@ func Down(ctx context.Context, cfg config.ComposeFile, opts ...DownOptions) erro
 	}
 
 	if len(orphans) > 0 {
-		removeOrphanContainers(ctx, orphans, ui, recordErr)
+		removeOrphanContainers(ctx, orphans, opt.RemoveVolumes, ui, recordErr)
 	}
 
 	if len(volumeNames) > 0 {
@@ -540,25 +549,40 @@ func Restart(ctx context.Context, cfg config.ComposeFile, targetServices []strin
 		return err
 	}
 
+	var existingFloors [][]string
 	selectedServices := make(map[string]config.Service)
 	for _, floor := range filtered {
+		var level []string
 		for _, name := range floor {
+			st, stErr := InspectContainerState(ctx, cfg.ContainerName(name))
+			if stErr == nil && !st.Exists {
+				continue
+			}
+			level = append(level, name)
 			selectedServices[name] = cfg.Services[name]
 		}
+		if len(level) > 0 {
+			existingFloors = append(existingFloors, level)
+		}
 	}
+
+	if len(existingFloors) == 0 {
+		return nil
+	}
+
 	waitConditions := computeWaitConditions(selectedServices, false)
 
 	ui := newProgressUI("Restarting")
-	for _, floor := range filtered {
+	for _, floor := range existingFloors {
 		for _, name := range floor {
 			ui.add("svc:"+name, "Container", cfg.ContainerName(name))
 		}
 	}
 	ui.start()
 
-	for i := len(filtered) - 1; i >= 0; i-- {
+	for i := len(existingFloors) - 1; i >= 0; i-- {
 		g, gctx := errgroup.WithContext(ctx)
-		for _, svcName := range filtered[i] {
+		for _, svcName := range existingFloors[i] {
 			name := svcName
 			containerName := cfg.ContainerName(name)
 			svcTimeout := resolveStopTimeout(timeout, cfg.Services[name])
@@ -578,7 +602,7 @@ func Restart(ctx context.Context, cfg config.ComposeFile, targetServices []strin
 		}
 	}
 
-	for _, floor := range filtered {
+	for _, floor := range existingFloors {
 		g, gctx := errgroup.WithContext(ctx)
 		for _, svcName := range floor {
 			name := svcName
@@ -589,6 +613,10 @@ func Restart(ctx context.Context, cfg config.ComposeFile, targetServices []strin
 				id := "svc:" + name
 				ui.setRunning(id, "Restarting")
 				if err := StartExistingContainer(gctx, containerName); err != nil {
+					if errors.Is(err, ErrNotFound) {
+						ui.setDone(id, "Skipped")
+						return nil
+					}
 					ui.setFailed(id, "Error")
 					return err
 				}

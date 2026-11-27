@@ -45,13 +45,36 @@ func (s *rollbackState) isEmpty() bool {
 	return len(s.networks) == 0 && len(s.volumes) == 0 && len(s.containers) == 0
 }
 
+func computeShutdownTimeout(cfg config.ComposeFile, floors [][]string, filter map[string]bool) time.Duration {
+	totalSecs := 0
+	for _, floor := range floors {
+		maxFloorSecs := 0
+		hasService := false
+		for _, svcName := range floor {
+			if filter != nil && !filter[svcName] {
+				continue
+			}
+			hasService = true
+			grace := resolveStopTimeout(-1, cfg.Services[svcName])
+			if grace > maxFloorSecs {
+				maxFloorSecs = grace
+			}
+		}
+		if hasService {
+			totalSecs += maxFloorSecs
+		}
+	}
+	total := time.Duration(totalSecs)*time.Second + 15*time.Second
+	if total < 30*time.Second {
+		total = 30 * time.Second
+	}
+	return total
+}
+
 func rollback(cfg config.ComposeFile, floors [][]string, state *rollbackState) {
 	if state.isEmpty() {
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 
 	state.mu.Lock()
 	containers := make(map[string]bool, len(state.containers))
@@ -61,6 +84,10 @@ func rollback(cfg config.ComposeFile, floors [][]string, state *rollbackState) {
 	volumes := append([]string(nil), state.volumes...)
 	networks := append([]string(nil), state.networks...)
 	state.mu.Unlock()
+
+	timeout := computeShutdownTimeout(cfg, floors, containers)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
 	sort.Strings(volumes)
 	sort.Strings(networks)

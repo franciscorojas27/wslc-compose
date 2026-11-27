@@ -84,7 +84,6 @@ func TestBindMountPreValidationAndBaseDirResolution(t *testing.T) {
 					Image: "nginx:alpine",
 					Volumes: config.VolumeMounts{
 						{
-							Type:   "volume",
 							Source: "default.conf",
 							Target: "/etc/nginx/conf.d/default.conf",
 						},

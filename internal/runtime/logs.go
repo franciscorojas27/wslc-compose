@@ -70,11 +70,55 @@ func Logs(ctx context.Context, cfg config.ComposeFile, targetServices []string, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, runErr := RunWSLCStream(ctx, func(line string) {
+			var (
+				streamMu      sync.Mutex
+				streamingLive bool
+				pendingStderr []string
+			)
+			emitLine := func(line string) {
 				printMu.Lock()
 				fmt.Fprintf(out, "%s%s\n", prefix, line)
 				printMu.Unlock()
+			}
+			flushPendingLocked := func() {
+				for _, pending := range pendingStderr {
+					emitLine(pending)
+				}
+				pendingStderr = nil
+			}
+			streamCtx := withStderrCallback(ctx, func(line string) {
+				streamMu.Lock()
+				defer streamMu.Unlock()
+				if streamingLive {
+					emitLine(line)
+					return
+				}
+				if opt.Follow && !looksLikeWSLCLogsError(line) {
+					flushPendingLocked()
+					streamingLive = true
+					emitLine(line)
+					return
+				}
+				pendingStderr = append(pendingStderr, line)
+			})
+			_, runErr := RunWSLCStreamRaw(streamCtx, func(line string) {
+				streamMu.Lock()
+				defer streamMu.Unlock()
+				if !streamingLive {
+					flushPendingLocked()
+					streamingLive = true
+				}
+				emitLine(line)
 			}, args...)
+
+			streamMu.Lock()
+			if runErr == nil || errors.Is(runErr, context.Canceled) {
+				flushPendingLocked()
+			} else {
+				pendingStderr = nil
+			}
+			streamMu.Unlock()
+
 			if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, ErrNotFound) {
 				errMu.Lock()
 				errs = append(errs, fmt.Errorf("failed to read logs for service %q: %w", name, runErr))
@@ -85,4 +129,26 @@ func Logs(ctx context.Context, cfg config.ComposeFile, targetServices []string, 
 
 	wg.Wait()
 	return errors.Join(errs...)
+}
+
+func looksLikeWSLCLogsError(line string) bool {
+	lower := strings.ToLower(strings.TrimSpace(stripANSI(line)))
+	if lower == "" {
+		return true
+	}
+	for _, kw := range []string{
+		"error",
+		"fata",
+		"not found",
+		"no such",
+		"does not exist",
+		"cannot find",
+		"unable to",
+		"failed to",
+	} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
 }

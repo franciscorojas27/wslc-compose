@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	goruntime "runtime"
 	"strings"
 	"sync"
 )
@@ -19,26 +20,93 @@ const (
 	maxBufferedStreamLines = 256
 )
 
+type stderrCallbackKey struct{}
+
+type streamPreserveSGRKey struct{}
+
+func withStderrCallback(ctx context.Context, fn func(string)) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, stderrCallbackKey{}, fn)
+}
+
 var (
 	ErrAlreadyExists        = errors.New("resource already exists")
 	ErrNotFound             = errors.New("resource not found")
 	ansiEscapeRe            = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+	ansiNonSGRRe            = regexp.MustCompile(`\x1b\[[0-9;?]*[a-ln-zA-Z]|\x1b\[\?[0-9;]*m`)
+	wslcCommandFunc         func(ctx context.Context, args ...string) *exec.Cmd
 	execWSLCFunc            = runWSLC
 	execWSLCInteractiveFunc = runWSLCInteractive
 	execWSLCStreamFunc      = runWSLCStream
 )
+
+func buildWSLCCommand(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	if wslcCommandFunc != nil {
+		return wslcCommandFunc(ctx, args...), nil
+	}
+	bin, err := ResolveWSLCBinary()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	return exec.CommandContext(ctx, bin, args...), nil
+}
+
+func ResolveWSLCBinary() (string, error) {
+	candidates := []string{"wslc.exe", "wslc"}
+	if goruntime.GOOS != "windows" {
+		candidates = []string{"wslc", "wslc.exe"}
+	}
+	var firstErr error
+	for _, name := range candidates {
+		p, err := exec.LookPath(name)
+		if err == nil && p != "" {
+			return p, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return "", fmt.Errorf("'wslc' was not found in system PATH: %w", firstErr)
+}
+
+func withPreserveSGR(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, streamPreserveSGRKey{}, true)
+}
+
+func shouldPreserveSGR(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(streamPreserveSGRKey{}).(bool)
+	return v
+}
+
+func stripNonSGRANSI(s string) string {
+	return ansiNonSGRRe.ReplaceAllString(s, "")
+}
 
 func RunWSLC(ctx context.Context, args ...string) (string, error) {
 	return execWSLCFunc(ctx, args...)
 }
 
 func runWSLC(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "wslc.exe", args...)
+	cmd, err := buildWSLCCommand(ctx, args...)
+	if err != nil {
+		return "", err
+	}
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
-	err := cmd.Run()
+	err = cmd.Run()
 	stdout := strings.TrimSpace(stdoutBuf.String())
 	stderr := strings.TrimSpace(stderrBuf.String())
 
@@ -61,7 +129,10 @@ func RunWSLCInteractive(ctx context.Context, args ...string) error {
 }
 
 func runWSLCInteractive(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, "wslc.exe", args...)
+	cmd, err := buildWSLCCommand(ctx, args...)
+	if err != nil {
+		return err
+	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -79,8 +150,15 @@ func RunWSLCStream(ctx context.Context, onLine func(string), args ...string) (st
 	return execWSLCStreamFunc(ctx, onLine, args...)
 }
 
+func RunWSLCStreamRaw(ctx context.Context, onLine func(string), args ...string) (string, error) {
+	return execWSLCStreamFunc(withPreserveSGR(ctx), onLine, args...)
+}
+
 func runWSLCStream(ctx context.Context, onLine func(string), args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "wslc.exe", args...)
+	cmd, err := buildWSLCCommand(ctx, args...)
+	if err != nil {
+		return "", err
+	}
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -95,6 +173,9 @@ func runWSLCStream(ctx context.Context, onLine func(string), args ...string) (st
 		return "", err
 	}
 
+	stderrCb, hasStderrCb := ctx.Value(stderrCallbackKey{}).(func(string))
+	preserveSGR := shouldPreserveSGR(ctx)
+
 	var (
 		mu          sync.Mutex
 		stdoutLines []string
@@ -104,18 +185,29 @@ func runWSLCStream(ctx context.Context, onLine func(string), args ...string) (st
 
 	consume := func(r io.Reader, isStderr bool) {
 		defer wg.Done()
-		scanStreamLines(r, func(rawLine string) {
-			line := stripANSI(rawLine)
+		readStreamLines(r, func(rawLine string) {
+			plain := stripANSI(rawLine)
+			line := plain
+			if preserveSGR {
+				line = stripNonSGRANSI(rawLine)
+			}
 			mu.Lock()
 			if isStderr {
-				if strings.TrimSpace(line) != "" {
-					stderrLines = appendBoundedLine(stderrLines, line, maxBufferedStreamLines)
+				if strings.TrimSpace(plain) != "" {
+					stderrLines = appendBoundedLine(stderrLines, plain, maxBufferedStreamLines)
+				}
+				if hasStderrCb {
+					if stderrCb != nil {
+						stderrCb(line)
+					}
+				} else if onLine != nil {
+					onLine(line)
 				}
 			} else {
 				stdoutLines = appendBoundedLine(stdoutLines, line, maxBufferedStreamLines)
-			}
-			if onLine != nil {
-				onLine(line)
+				if onLine != nil {
+					onLine(line)
+				}
 			}
 			mu.Unlock()
 		})
@@ -132,18 +224,18 @@ func runWSLCStream(ctx context.Context, onLine func(string), args ...string) (st
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		return "", classifyWSLCError(selectErrorRaw(stderrLines, stdoutLines), waitErr)
+		cleanStdout := make([]string, len(stdoutLines))
+		for i, l := range stdoutLines {
+			cleanStdout[i] = stripANSI(l)
+		}
+		return "", classifyWSLCError(selectErrorRaw(stderrLines, cleanStdout), waitErr)
 	}
 
 	return strings.TrimSpace(strings.Join(stdoutLines, "\n")), nil
 }
 
 func scanStreamLines(r io.Reader, handle func(string)) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxStreamLineBytes)
-	for scanner.Scan() {
-		handle(scanner.Text())
-	}
+	readStreamLines(r, handle)
 }
 
 func readStreamLines(r io.Reader, handle func(string)) {
@@ -151,11 +243,9 @@ func readStreamLines(r io.Reader, handle func(string)) {
 	chunk := make([]byte, 32*1024)
 	var lineBuf []byte
 	skipLeadingLF := false
+	justFlushedMax := false
 
-	flush := func() {
-		if len(lineBuf) == 0 {
-			return
-		}
+	emit := func() {
 		handle(string(lineBuf))
 		lineBuf = lineBuf[:0]
 	}
@@ -173,8 +263,14 @@ func readStreamLines(r io.Reader, handle func(string)) {
 			for i := 0; i < len(data); i++ {
 				b := data[i]
 				if b == '\n' || b == '\r' {
-					lineBuf = append(lineBuf, data[start:i]...)
-					flush()
+					if i > start {
+						lineBuf = append(lineBuf, data[start:i]...)
+						justFlushedMax = false
+					}
+					if len(lineBuf) > 0 || !justFlushedMax {
+						emit()
+					}
+					justFlushedMax = false
 					if b == '\r' {
 						if i+1 < len(data) {
 							if data[i+1] == '\n' {
@@ -187,21 +283,26 @@ func readStreamLines(r io.Reader, handle func(string)) {
 					start = i + 1
 				} else if len(lineBuf)+(i-start) >= maxStreamLineBytes {
 					lineBuf = append(lineBuf, data[start:i]...)
-					flush()
+					emit()
+					justFlushedMax = true
 					start = i
 				}
 			}
 
 			if start < len(data) {
 				lineBuf = append(lineBuf, data[start:]...)
+				justFlushedMax = false
 				if len(lineBuf) >= maxStreamLineBytes {
-					flush()
+					emit()
+					justFlushedMax = true
 				}
 			}
 		}
 
 		if err != nil {
-			flush()
+			if len(lineBuf) > 0 {
+				emit()
+			}
 			return
 		}
 	}

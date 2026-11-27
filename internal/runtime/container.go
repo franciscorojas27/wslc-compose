@@ -37,6 +37,7 @@ type ContainerState struct {
 	Health     string
 	ExitCode   int
 	Image      string
+	ImageID    string
 	ConfigHash string
 }
 
@@ -147,7 +148,7 @@ func validateServiceBindMounts(cfg config.ComposeFile, serviceName string, svc c
 }
 
 func resolveBindMountSource(cfg config.ComposeFile, mount config.VolumeMount) (string, bool) {
-	if mount.Source == "" || strings.EqualFold(mount.Type, "tmpfs") {
+	if mount.Source == "" || strings.EqualFold(mount.Type, "tmpfs") || strings.EqualFold(mount.Type, "volume") {
 		return "", false
 	}
 	_, isNamed := cfg.Volumes[mount.Source]
@@ -262,14 +263,40 @@ func resolveNetworkAttachments(cfg config.ComposeFile, serviceName string, servi
 }
 
 func computeServiceConfigHash(cfg config.ComposeFile, serviceName string, svc config.Service, image string) string {
+	var resolvedNetworks []string
+	if len(svc.Networks) == 0 {
+		if cfg.Name != "" || cfg.BaseDir != "" || cfg.ProjectDir != "" || len(cfg.Services) > 0 {
+			resolvedNetworks = []string{"default=" + defaultProjectNetworkName(cfg)}
+		}
+	} else {
+		for _, key := range svc.Networks.SortedNames() {
+			resolvedNetworks = append(resolvedNetworks, key+"="+cfg.NetworkName(key))
+		}
+	}
+
+	var resolvedVolumes []string
+	for _, mount := range svc.Volumes {
+		if mount.Source == "" {
+			continue
+		}
+		if _, isNamed := cfg.Volumes[mount.Source]; isNamed && !strings.EqualFold(mount.Type, "bind") {
+			resolvedVolumes = append(resolvedVolumes, mount.Source+"="+cfg.VolumeName(mount.Source))
+		}
+	}
+	sort.Strings(resolvedVolumes)
+
 	payload := struct {
-		ServiceName string
-		Image       string
-		Service     config.Service
+		ServiceName      string
+		Image            string
+		Service          config.Service
+		ResolvedNetworks []string
+		ResolvedVolumes  []string
 	}{
-		ServiceName: serviceName,
-		Image:       image,
-		Service:     svc,
+		ServiceName:      serviceName,
+		Image:            image,
+		Service:          svc,
+		ResolvedNetworks: resolvedNetworks,
+		ResolvedVolumes:  resolvedVolumes,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -298,7 +325,7 @@ func buildContainerArgs(subcmd string, cfg config.ComposeFile, serviceName strin
 	if subcmd == "run" && ov.Detach {
 		args = append(args, "-d")
 	}
-	if subcmd == "run" && ov.AutoRemove {
+	if (subcmd == "run" || subcmd == "create") && ov.AutoRemove {
 		args = append(args, "--rm")
 	}
 	if containerName != "" {

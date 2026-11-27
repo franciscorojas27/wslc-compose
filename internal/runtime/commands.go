@@ -415,10 +415,8 @@ func Images(ctx context.Context, cfg config.ComposeFile, targetServices []string
 	}
 
 	findLocal := func(ref string) (ImageInfo, bool) {
-		repo, tag := splitImageRef(ref)
-		normRepo := trimRegistryPrefix(repo)
 		for _, img := range localImages {
-			if trimRegistryPrefix(img.Repository) == normRepo && img.Tag == tag {
+			if matchImageInfo(img, ref) {
 				return img, true
 			}
 		}
@@ -456,8 +454,10 @@ func Images(ctx context.Context, cfg config.ComposeFile, targetServices []string
 			if info.Repository != "" {
 				repo = info.Repository
 			}
-			if info.Tag != "" {
+			if info.Tag != "" && info.Tag != "<none>" {
 				tag = info.Tag
+			} else if info.Digest != "" {
+				tag = info.Digest
 			}
 			if info.ID != "" {
 				imgID = info.ID
@@ -543,7 +543,7 @@ func matchStrictProjectContainerName(name string, proj string) (string, bool) {
 	return rest[:lastDash], true
 }
 
-func removeOrphanContainers(ctx context.Context, orphans []ContainerInfo, ui *progressUI, recordErr func(error)) {
+func removeOrphanContainers(ctx context.Context, orphans []ContainerInfo, removeVolumes bool, ui *progressUI, recordErr func(error)) {
 	var wg sync.WaitGroup
 	for _, item := range orphans {
 		c := item
@@ -554,7 +554,7 @@ func removeOrphanContainers(ctx context.Context, orphans []ContainerInfo, ui *pr
 			if ui != nil {
 				ui.setRunning(id, "Removing")
 			}
-			if err := StopAndRemoveContainer(ctx, c.Name); err != nil {
+			if err := RemoveContainer(ctx, c.Name, true, removeVolumes); err != nil {
 				if ui != nil {
 					ui.setFailed(id, "Error")
 				}

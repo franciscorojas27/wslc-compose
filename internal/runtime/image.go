@@ -2,9 +2,11 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -30,6 +32,7 @@ type PullProgress struct {
 type ImageInfo struct {
 	Repository string
 	Tag        string
+	Digest     string
 	ID         string
 	Size       string
 }
@@ -41,15 +44,26 @@ var (
 	layerIDRe    = regexp.MustCompile(`^(?:sha256:)?([0-9a-fA-F]{6,64}):\s*(.+)$`)
 	asciiBarRe   = regexp.MustCompile(`\[[=\->#\.\s]+\]`)
 	multiSpaceRe = regexp.MustCompile(`\s{2,}`)
+	hexImageIDRe = regexp.MustCompile(`^(?:sha256:)?[0-9a-fA-F]{12,64}$`)
 )
+
+func isPOSIXAbsPath(p string) bool {
+	return strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//")
+}
 
 func buildImageArgs(tag string, build config.BuildConfig, opt BuildOptions) []string {
 	buildContext := build.Context
 	if buildContext == "" {
 		buildContext = "."
 	}
-	if !filepath.IsAbs(buildContext) && opt.ProjectDir != "" {
-		buildContext = filepath.Join(opt.ProjectDir, buildContext)
+	if isPOSIXAbsPath(buildContext) {
+		buildContext = path.Clean(buildContext)
+	} else if !filepath.IsAbs(buildContext) && opt.ProjectDir != "" {
+		if isPOSIXAbsPath(opt.ProjectDir) && filepath.Separator == '/' {
+			buildContext = path.Join(path.Clean(opt.ProjectDir), buildContext)
+		} else {
+			buildContext = filepath.Join(opt.ProjectDir, buildContext)
+		}
 	}
 
 	args := []string{"build", "-t", tag}
@@ -64,8 +78,14 @@ func buildImageArgs(tag string, build config.BuildConfig, opt BuildOptions) []st
 
 	if build.Dockerfile != "" {
 		dockerfilePath := build.Dockerfile
-		if !filepath.IsAbs(dockerfilePath) {
-			dockerfilePath = filepath.Join(buildContext, dockerfilePath)
+		if isPOSIXAbsPath(dockerfilePath) {
+			dockerfilePath = path.Clean(dockerfilePath)
+		} else if !filepath.IsAbs(dockerfilePath) {
+			if isPOSIXAbsPath(buildContext) {
+				dockerfilePath = path.Join(buildContext, dockerfilePath)
+			} else {
+				dockerfilePath = filepath.Join(buildContext, dockerfilePath)
+			}
 		}
 		args = append(args, "-f", dockerfilePath)
 	}
@@ -512,32 +532,76 @@ func EnsureImage(ctx context.Context, image string) (bool, error) {
 	return true, nil
 }
 
-func ListImages(ctx context.Context) ([]ImageInfo, error) {
-	out, err := RunWSLC(ctx, "images", "--format", "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}")
-	if err == nil && !strings.Contains(out, "{{.") && (out == "" || strings.Contains(out, "\t")) {
-		var list []ImageInfo
-		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
+func sameImageID(a, b string) bool {
+	na := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(a)), "sha256:")
+	nb := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(b)), "sha256:")
+	if na == "" || nb == "" {
+		return true
+	}
+	if len(na) >= 12 && len(nb) >= 12 && (strings.HasPrefix(na, nb) || strings.HasPrefix(nb, na)) {
+		return true
+	}
+	return na == nb
+}
+
+func InspectImageID(ctx context.Context, image string) string {
+	if image == "" {
+		return ""
+	}
+	out, err := RunWSLC(ctx, "image", "inspect", "--format", "{{.Id}}", image)
+	if err == nil {
+		trimmed := strings.TrimSpace(out)
+		if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+			if id := parseImageIDFromJSON(trimmed); id != "" {
+				return id
 			}
-			parts := strings.Split(line, "\t")
-			if len(parts) < 2 {
-				continue
-			}
-			info := ImageInfo{
-				Repository: strings.TrimSpace(parts[0]),
-				Tag:        strings.TrimSpace(parts[1]),
-			}
-			if len(parts) > 2 {
-				info.ID = strings.TrimSpace(parts[2])
-			}
-			if len(parts) > 3 {
-				info.Size = strings.TrimSpace(parts[3])
-			}
-			list = append(list, info)
+		} else if !strings.Contains(trimmed, "{{.") && trimmed != "<no value>" && hexImageIDRe.MatchString(trimmed) {
+			return trimmed
 		}
-		return list, nil
+	} else if errors.Is(err, ErrNotFound) {
+		return ""
+	}
+
+	imgs, listErr := ListImages(ctx)
+	if listErr != nil {
+		return ""
+	}
+	for _, img := range imgs {
+		if matchImageInfo(img, image) && img.ID != "" {
+			return img.ID
+		}
+	}
+	return ""
+}
+
+func parseImageIDFromJSON(raw string) string {
+	type doc struct {
+		ID string `json:"Id"`
+	}
+	var docs []doc
+	if err := json.Unmarshal([]byte(raw), &docs); err == nil {
+		for _, d := range docs {
+			if strings.TrimSpace(d.ID) != "" {
+				return strings.TrimSpace(d.ID)
+			}
+		}
+	}
+	var single doc
+	if err := json.Unmarshal([]byte(raw), &single); err == nil && strings.TrimSpace(single.ID) != "" {
+		return strings.TrimSpace(single.ID)
+	}
+	return ""
+}
+
+func ListImages(ctx context.Context) ([]ImageInfo, error) {
+	out, err := RunWSLC(ctx, "images", "--format", "{{.Repository}}\t{{.Tag}}\t{{.Digest}}\t{{.ID}}\t{{.Size}}")
+	if err == nil && !strings.Contains(out, "{{.") && (out == "" || strings.Contains(out, "\t")) {
+		return parseFormattedImages(out), nil
+	}
+
+	out, err = RunWSLC(ctx, "images", "--format", "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}")
+	if err == nil && !strings.Contains(out, "{{.") && (out == "" || strings.Contains(out, "\t")) {
+		return parseFormattedImages(out), nil
 	}
 
 	out, err = RunWSLC(ctx, "images")
@@ -545,63 +609,245 @@ func ListImages(ctx context.Context) ([]ImageInfo, error) {
 		return nil, fmt.Errorf("failed to list images: %w", err)
 	}
 
-	lines := strings.Split(out, "\n")
+	return parseImagesTable(out), nil
+}
+
+func parseFormattedImages(raw string) []ImageInfo {
+	var list []ImageInfo
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 2 {
+			continue
+		}
+		info := ImageInfo{
+			Repository: strings.TrimSpace(parts[0]),
+			Tag:        strings.TrimSpace(parts[1]),
+		}
+		if len(parts) >= 5 {
+			dig := strings.TrimSpace(parts[2])
+			if dig != "<none>" && dig != "<no value>" {
+				info.Digest = dig
+			}
+			info.ID = strings.TrimSpace(parts[3])
+			info.Size = strings.TrimSpace(parts[4])
+		} else {
+			if len(parts) > 2 {
+				info.ID = strings.TrimSpace(parts[2])
+			}
+			if len(parts) > 3 {
+				info.Size = strings.TrimSpace(parts[3])
+			}
+		}
+		normalizeImageInfoFields(&info)
+		list = append(list, info)
+	}
+	return list
+}
+
+func normalizeImageInfoFields(info *ImageInfo) {
+	if strings.Contains(info.Repository, "@") {
+		r, t, d := parseImageRefParts(info.Repository)
+		info.Repository = r
+		if (info.Tag == "" || info.Tag == "<none>") && t != "" {
+			info.Tag = t
+		}
+		if info.Digest == "" && d != "" {
+			info.Digest = d
+		}
+	}
+}
+
+func parseImagesTable(raw string) []ImageInfo {
+	lines := strings.Split(raw, "\n")
 	if len(lines) == 0 {
-		return nil, nil
+		return nil
 	}
 
-	startIdx := 0
-	upperFirst := strings.ToUpper(lines[0])
-	if strings.Contains(upperFirst, "REPOSITORY") || strings.Contains(upperFirst, "REPOSITORIO") {
-		startIdx = 1
+	firstIdx := -1
+	for i, l := range lines {
+		if strings.TrimSpace(l) != "" {
+			firstIdx = i
+			break
+		}
+	}
+	if firstIdx < 0 {
+		return nil
+	}
+
+	headerLine := strings.TrimRight(lines[firstIdx], "\r")
+	upperFirst := strings.ToUpper(headerLine)
+	hasHeader := strings.Contains(upperFirst, "REPOSITORY") || strings.Contains(upperFirst, "REPOSITORIO") || strings.Contains(upperFirst, "IMAGE ID")
+
+	if hasHeader {
+		headers := multiSpaceRe.Split(strings.TrimSpace(headerLine), -1)
+		if len(headers) == 0 {
+			return nil
+		}
+		offsets := findHeaderRuneOffsets(headerLine, headers)
+		var list []ImageInfo
+		for _, rawLine := range lines[firstIdx+1:] {
+			line := strings.TrimRight(rawLine, "\r")
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			cols := make([]string, len(headers))
+			splitCols := multiSpaceRe.Split(strings.TrimSpace(line), -1)
+			if len(splitCols) == len(headers) {
+				cols = splitCols
+			} else {
+				lineRunes := []rune(line)
+				for i := range headers {
+					start := offsets[i]
+					if start >= len(lineRunes) {
+						continue
+					}
+					end := len(lineRunes)
+					if i+1 < len(headers) && offsets[i+1] < end {
+						end = offsets[i+1]
+					}
+					cols[i] = strings.TrimSpace(string(lineRunes[start:end]))
+				}
+			}
+
+			var info ImageInfo
+			for i, h := range headers {
+				val := strings.TrimSpace(cols[i])
+				switch strings.ToUpper(strings.TrimSpace(h)) {
+				case "REPOSITORY", "REPOSITORIO", "NAME":
+					info.Repository = val
+				case "TAG", "ETIQUETA":
+					info.Tag = val
+				case "DIGEST", "RESUMEN":
+					if val != "<none>" && val != "<no value>" {
+						info.Digest = val
+					}
+				case "IMAGE ID", "ID", "ID DE IMAGEN", "ID. DE IMAGEN":
+					info.ID = val
+				case "SIZE", "TAMAÑO", "BLOB SIZE", "VIRTUAL SIZE":
+					info.Size = val
+				}
+			}
+			normalizeImageInfoFields(&info)
+			if info.Repository != "" || info.ID != "" {
+				list = append(list, info)
+			}
+		}
+		return list
 	}
 
 	var list []ImageInfo
-	for _, line := range lines[startIdx:] {
+	for _, line := range lines[firstIdx:] {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
 		}
 		cols := multiSpaceRe.Split(trimmed, -1)
 		if len(cols) < 2 {
-			continue
+			cols = strings.Fields(trimmed)
+			if len(cols) < 2 {
+				continue
+			}
 		}
 		info := ImageInfo{
 			Repository: strings.TrimSpace(cols[0]),
 			Tag:        strings.TrimSpace(cols[1]),
 		}
-		if len(cols) > 2 {
-			info.ID = strings.TrimSpace(cols[2])
+		if len(cols) >= 5 && strings.Contains(cols[2], ":") {
+			dig := strings.TrimSpace(cols[2])
+			if dig != "<none>" {
+				info.Digest = dig
+			}
+			info.ID = strings.TrimSpace(cols[3])
+			info.Size = strings.TrimSpace(cols[len(cols)-1])
+		} else {
+			if len(cols) > 2 {
+				info.ID = strings.TrimSpace(cols[2])
+			}
+			if len(cols) > 3 {
+				info.Size = strings.TrimSpace(cols[len(cols)-1])
+			}
 		}
-		if len(cols) > 4 {
-			info.Size = strings.TrimSpace(cols[4])
-		} else if len(cols) > 3 {
-			info.Size = strings.TrimSpace(cols[3])
-		}
+		normalizeImageInfoFields(&info)
 		list = append(list, info)
 	}
+	return list
+}
 
-	return list, nil
+func parseImageRefParts(ref string) (string, string, string) {
+	if atIdx := strings.Index(ref, "@"); atIdx >= 0 {
+		namePart := ref[:atIdx]
+		digest := ref[atIdx+1:]
+		lastSlash := strings.LastIndex(namePart, "/")
+		lastColon := strings.LastIndex(namePart, ":")
+		if lastColon > lastSlash {
+			return namePart[:lastColon], namePart[lastColon+1:], digest
+		}
+		return namePart, "", digest
+	}
+	repo, tag := splitImageRef(ref)
+	return repo, tag, ""
+}
+
+func matchImageInfo(img ImageInfo, ref string) bool {
+	targetRepo, targetTag, targetDigest := parseImageRefParts(ref)
+	normTargetRepo := trimRegistryPrefix(targetRepo)
+
+	imgRepo := img.Repository
+	imgTag := img.Tag
+	imgDigest := img.Digest
+	if strings.Contains(imgRepo, "@") {
+		r, t, d := parseImageRefParts(imgRepo)
+		imgRepo = r
+		if (imgTag == "" || imgTag == "<none>") && t != "" {
+			imgTag = t
+		}
+		if imgDigest == "" && d != "" {
+			imgDigest = d
+		}
+	}
+	if trimRegistryPrefix(imgRepo) != normTargetRepo {
+		return false
+	}
+
+	if targetDigest != "" {
+		if imgDigest != "" && strings.EqualFold(imgDigest, targetDigest) {
+			return true
+		}
+		if strings.EqualFold(imgTag, targetDigest) || strings.EqualFold(imgTag, targetTag+"@"+targetDigest) {
+			return true
+		}
+		if img.ID != "" && strings.Contains(targetDigest, ":") && sameImageID(img.ID, targetDigest) {
+			return true
+		}
+		return false
+	}
+
+	return imgTag == targetTag
 }
 
 func imageInList(raw string, image string) bool {
-	targetRepo, targetTag := splitImageRef(image)
-	targetRepo = trimRegistryPrefix(targetRepo)
-
 	for _, line := range strings.Split(raw, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		if fields[0] == image {
+		if len(fields) > 0 && fields[0] == image {
 			return true
 		}
-		if len(fields) >= 2 {
-			repo := trimRegistryPrefix(fields[0])
-			tag := fields[1]
-			if repo == targetRepo && tag == targetTag {
+	}
+
+	if strings.Contains(raw, "\t") {
+		for _, img := range parseFormattedImages(raw) {
+			if matchImageInfo(img, image) {
 				return true
 			}
+		}
+	}
+
+	for _, img := range parseImagesTable(raw) {
+		if matchImageInfo(img, image) {
+			return true
 		}
 	}
 

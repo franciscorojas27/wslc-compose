@@ -348,7 +348,7 @@ func createManagedVolumes(ctx context.Context, cfg config.ComposeFile, keys []st
 	return g.Wait()
 }
 
-func containerIsUpToDate(st ContainerState, expectedImage string, expectedHash string) bool {
+func containerIsUpToDate(st ContainerState, expectedImage string, expectedHash string, currentImageID ...string) bool {
 	if st.ConfigHash != "" && expectedHash != "" && st.ConfigHash != expectedHash {
 		return false
 	}
@@ -358,6 +358,9 @@ func containerIsUpToDate(st ContainerState, expectedImage string, expectedHash s
 		if trimRegistryPrefix(stRepo) != trimRegistryPrefix(expRepo) || stTag != expTag {
 			return false
 		}
+	}
+	if len(currentImageID) > 0 && st.ImageID != "" && currentImageID[0] != "" && !sameImageID(st.ImageID, currentImageID[0]) {
+		return false
 	}
 	return true
 }
@@ -371,8 +374,13 @@ func startFloorService(ctx context.Context, cfg config.ComposeFile, name string,
 	if !opt.ForceRecreate {
 		st, err := InspectContainerState(ctx, containerName)
 		if err == nil && st.Exists {
+			var currentImageID string
+			if !opt.NoRecreate && !opt.Build && st.ImageID != "" {
+				currentImageID = InspectImageID(ctx, expectedImage)
+			}
+
 			if waitCond == "service_completed_successfully" && st.Status == "exited" && st.ExitCode == 0 {
-				if opt.NoRecreate || (!opt.Build && containerIsUpToDate(st, expectedImage, expectedHash)) {
+				if opt.NoRecreate || (!opt.Build && containerIsUpToDate(st, expectedImage, expectedHash, currentImageID)) {
 					ui.setDone(id, "Completed")
 					return nil
 				}
@@ -403,7 +411,7 @@ func startFloorService(ctx context.Context, cfg config.ComposeFile, name string,
 				return nil
 			}
 
-			if !opt.Build && st.Status == "running" && containerIsUpToDate(st, expectedImage, expectedHash) {
+			if !opt.Build && st.Status == "running" && containerIsUpToDate(st, expectedImage, expectedHash, currentImageID) {
 				if waitCond != "" && waitCond != "service_started" {
 					ui.setRunning(id, "Waiting")
 					if waitErr := WaitForCondition(ctx, containerName, svc, waitCond); waitErr != nil {
@@ -547,21 +555,23 @@ func selectRMIImages(cfg config.ComposeFile, mode string) []string {
 		return nil
 	}
 
+	activeCfg := cfg.FilterByProfiles(cfg.ActiveProfiles, nil)
+
 	seen := make(map[string]bool)
 	var images []string
 
-	names := make([]string, 0, len(cfg.Services))
-	for name := range cfg.Services {
+	names := make([]string, 0, len(activeCfg.Services))
+	for name := range activeCfg.Services {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	for _, name := range names {
-		svc := cfg.Services[name]
+		svc := activeCfg.Services[name]
 		if mode == "local" && (svc.Image != "" || svc.Build.IsZero()) {
 			continue
 		}
-		img := serviceImageTag(cfg, name, svc)
+		img := serviceImageTag(activeCfg, name, svc)
 		if img == "" || seen[img] {
 			continue
 		}

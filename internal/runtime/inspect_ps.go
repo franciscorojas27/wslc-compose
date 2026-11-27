@@ -12,6 +12,7 @@ import (
 )
 
 type inspectStateDocument struct {
+	Image string `json:"Image"`
 	State struct {
 		Status   string `json:"Status"`
 		ExitCode int    `json:"ExitCode"`
@@ -26,7 +27,7 @@ type inspectStateDocument struct {
 }
 
 func InspectContainerState(ctx context.Context, name string) (ContainerState, error) {
-	out, err := RunWSLC(ctx, "inspect", "--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.State.ExitCode}}|{{if .Config}}{{.Config.Image}}|{{index .Config.Labels \"com.wslc.compose.config-hash\"}}{{end}}", name)
+	out, err := RunWSLC(ctx, "inspect", "--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.State.ExitCode}}|{{if .Config}}{{.Config.Image}}|{{index .Config.Labels \"com.wslc.compose.config-hash\"}}{{end}}|{{.Image}}", name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return ContainerState{Exists: false}, nil
@@ -109,6 +110,12 @@ func InspectContainerState(ctx context.Context, name string) (ContainerState, er
 			st.ConfigHash = val
 		}
 	}
+	if len(parts) > 5 {
+		imgID := strings.TrimSpace(parts[5])
+		if imgID != "<no value>" {
+			st.ImageID = imgID
+		}
+	}
 	return st, nil
 }
 
@@ -131,6 +138,7 @@ func parseStateFromInspectJSON(raw string) (ContainerState, bool) {
 			Status:   status,
 			ExitCode: doc.State.ExitCode,
 			Image:    strings.TrimSpace(doc.Config.Image),
+			ImageID:  strings.TrimSpace(doc.Image),
 		}
 		if doc.State.Health != nil {
 			st.Health = strings.ToLower(strings.TrimSpace(doc.State.Health.Status))
@@ -148,6 +156,10 @@ func parseStateFromStatusText(status string) ContainerState {
 	st := ContainerState{Exists: true}
 
 	switch {
+	case strings.Contains(lower, "(paused)"), strings.HasPrefix(lower, "paused"):
+		st.Status = "paused"
+	case strings.HasPrefix(lower, "removing"), strings.HasPrefix(lower, "removal in progress"):
+		st.Status = "removing"
 	case strings.HasPrefix(lower, "up"), strings.HasPrefix(lower, "running"):
 		st.Status = "running"
 	case strings.HasPrefix(lower, "exited"):
@@ -163,8 +175,6 @@ func parseStateFromStatusText(status string) ContainerState {
 		st.Status = "created"
 	case strings.HasPrefix(lower, "restarting"):
 		st.Status = "restarting"
-	case strings.HasPrefix(lower, "paused"):
-		st.Status = "paused"
 	case strings.HasPrefix(lower, "dead"):
 		st.Status = "dead"
 	default:
@@ -203,10 +213,16 @@ func WaitForCondition(ctx context.Context, containerName string, svc config.Serv
 	}
 }
 
+var (
+	waitCompletedPollInterval = 500 * time.Millisecond
+	maxCreatedWaitPolls       = 6
+)
+
 func waitForCompleted(ctx context.Context, containerName string) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(waitCompletedPollInterval)
 	defer ticker.Stop()
 
+	createdPolls := 0
 	for {
 		st, err := InspectContainerState(ctx, containerName)
 		if err != nil {
@@ -223,6 +239,17 @@ func waitForCompleted(ctx context.Context, containerName string) error {
 		}
 		if st.Status == "dead" {
 			return fmt.Errorf("container %q died while waiting for completion", containerName)
+		}
+		if st.Status == "restarting" || st.Status == "paused" || st.Status == "removing" {
+			return fmt.Errorf("container %q entered state %q while waiting for completion", containerName, st.Status)
+		}
+		if st.Status == "created" {
+			createdPolls++
+			if createdPolls >= maxCreatedWaitPolls {
+				return fmt.Errorf("container %q remained stuck in state \"created\" while waiting for completion", containerName)
+			}
+		} else {
+			createdPolls = 0
 		}
 
 		select {
@@ -270,26 +297,38 @@ func waitForHealthy(ctx context.Context, containerName string, svc config.Servic
 		if st.Status == "exited" || st.Status == "dead" {
 			return fmt.Errorf("container %q exited unexpectedly (code %d) while waiting to become healthy", containerName, st.ExitCode)
 		}
-		if st.Health == "healthy" {
-			return nil
+		if st.Status == "paused" || st.Status == "removing" {
+			return fmt.Errorf("container %q entered state %q while waiting to become healthy", containerName, st.Status)
 		}
 		if st.Health == "unhealthy" {
 			return fmt.Errorf("container %q is unhealthy", containerName)
 		}
 
-		if st.Health == "" {
-			if isHealthCheckDisabled(svc.HealthCheck) {
-				if st.Status == "running" {
-					return nil
+		if st.Status == "restarting" || st.Status == "created" {
+			if !time.Now().Before(deadline) {
+				consecutiveFailures++
+				if consecutiveFailures >= retries {
+					return fmt.Errorf("container %q remained in state %q after %d retries while waiting to become healthy", containerName, st.Status, retries)
 				}
-			} else if st.Status == "running" {
-				if runHealthProbe(ctx, containerName, svc.HealthCheck.Test, probeTimeout) == nil {
-					return nil
-				}
-				if time.Now().After(deadline) {
-					consecutiveFailures++
-					if consecutiveFailures >= retries {
-						return fmt.Errorf("container %q failed healthcheck after %d retries", containerName, retries)
+			}
+		} else {
+			if st.Health == "healthy" {
+				return nil
+			}
+			if st.Health == "" {
+				if isHealthCheckDisabled(svc.HealthCheck) {
+					if st.Status == "running" {
+						return nil
+					}
+				} else if st.Status == "running" {
+					if runHealthProbe(ctx, containerName, svc.HealthCheck.Test, probeTimeout) == nil {
+						return nil
+					}
+					if !time.Now().Before(deadline) {
+						consecutiveFailures++
+						if consecutiveFailures >= retries {
+							return fmt.Errorf("container %q failed healthcheck after %d retries", containerName, retries)
+						}
 					}
 				}
 			}

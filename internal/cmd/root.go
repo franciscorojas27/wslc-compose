@@ -5,22 +5,75 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
 	"wslc-compose/internal/config"
+	"wslc-compose/internal/runtime"
 
 	"github.com/spf13/cobra"
 )
 
 var (
-	version      = "dev"
-	composeFiles []string
-	projectName  string
-	envFile      string
-	profiles     []string
+	version             = "dev"
+	composeFiles        []string
+	composeFilesChanged bool
+	projectName         string
+	envFile             string
+	profiles            []string
 )
+
+type composeFilesValue struct{}
+
+func newComposeFilesValue() *composeFilesValue {
+	return &composeFilesValue{}
+}
+
+func (v *composeFilesValue) String() string {
+	if len(composeFiles) == 0 {
+		return "[]"
+	}
+	return "[" + strings.Join(composeFiles, ",") + "]"
+}
+
+func (v *composeFilesValue) Set(val string) error {
+	if !composeFilesChanged {
+		composeFiles = []string{val}
+		composeFilesChanged = true
+	} else {
+		composeFiles = append(composeFiles, val)
+	}
+	return nil
+}
+
+func (v *composeFilesValue) Type() string {
+	return "stringArray"
+}
+
+func (v *composeFilesValue) Append(val string) error {
+	composeFiles = append(composeFiles, val)
+	composeFilesChanged = true
+	return nil
+}
+
+func (v *composeFilesValue) Replace(val []string) error {
+	if len(val) == 0 {
+		composeFiles = nil
+		composeFilesChanged = false
+		return nil
+	}
+	cp := make([]string, len(val))
+	copy(cp, val)
+	composeFiles = cp
+	composeFilesChanged = true
+	return nil
+}
+
+func (v *composeFilesValue) GetSlice() []string {
+	cp := make([]string, len(composeFiles))
+	copy(cp, composeFiles)
+	return cp
+}
 
 var rootCmd = &cobra.Command{
 	Use:              "wslc-compose",
@@ -31,8 +84,8 @@ var rootCmd = &cobra.Command{
 		if shouldSkipWSLCLookup(cmd) {
 			return nil
 		}
-		if _, err := exec.LookPath("wslc"); err != nil {
-			return fmt.Errorf("'wslc' was not found in system PATH: %w", err)
+		if _, err := runtime.ResolveWSLCBinary(); err != nil {
+			return err
 		}
 		return nil
 	},
@@ -146,38 +199,37 @@ func activeProfiles() []string {
 }
 
 func loadCompose(explicitServices []string) (config.ComposeFile, error) {
-	active := activeProfiles()
 	cfg, err := config.Load("", config.LoadOptions{
-		Files:       resolvedComposeFiles(),
-		ProjectName: resolvedProjectName(),
-		EnvFile:     envFile,
-		Profiles:    active,
+		Files:            resolvedComposeFiles(),
+		ProjectName:      resolvedProjectName(),
+		EnvFile:          envFile,
+		Profiles:         activeProfiles(),
+		ExplicitServices: explicitServices,
 	})
 	if err != nil {
 		return config.ComposeFile{}, err
 	}
-	return cfg.FilterByProfiles(active, explicitServices), nil
+	return cfg.FilterByProfiles(cfg.ActiveProfiles, explicitServices), nil
 }
 
 func loadComposeAll() (config.ComposeFile, error) {
-	active := activeProfiles()
 	cfg, err := config.Load("", config.LoadOptions{
 		Files:       resolvedComposeFiles(),
 		ProjectName: resolvedProjectName(),
 		EnvFile:     envFile,
-		Profiles:    active,
+		Profiles:    activeProfiles(),
 	})
 	if err != nil {
 		return config.ComposeFile{}, err
 	}
-	if len(active) > 0 {
-		return cfg.FilterByProfiles(active, nil), nil
+	if len(cfg.ActiveProfiles) > 0 {
+		return cfg.FilterByProfiles(cfg.ActiveProfiles, nil), nil
 	}
 	return cfg, nil
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringArrayVarP(&composeFiles, "file", "f", nil, "Compose configuration file path")
+	rootCmd.PersistentFlags().VarP(newComposeFilesValue(), "file", "f", "Compose configuration file path")
 	rootCmd.PersistentFlags().StringVarP(&projectName, "project-name", "p", "", "Project name")
 	rootCmd.PersistentFlags().StringVar(&envFile, "env-file", "", "Specify an alternate environment file")
 	rootCmd.PersistentFlags().StringArrayVar(&profiles, "profile", nil, "Specify a profile to enable")

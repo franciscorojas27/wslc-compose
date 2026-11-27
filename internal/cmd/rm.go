@@ -29,7 +29,7 @@ var rmCmd = &cobra.Command{
 }
 
 func init() {
-	rmCmd.Flags().StringArrayVar(&composeFiles, "file", nil, "Compose configuration file")
+	rmCmd.Flags().Var(newComposeFilesValue(), "file", "Compose configuration file")
 	_ = rmCmd.Flags().MarkHidden("file")
 	rmCmd.Flags().BoolVarP(&rmForce, "force", "f", false, "Do not ask to confirm removal")
 	rmCmd.Flags().BoolVarP(&rmStop, "stop", "s", false, "Stop the containers, if required, before removing")

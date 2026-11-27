@@ -15,6 +15,102 @@ func derefAlias(n *yaml.Node) *yaml.Node {
 	return n
 }
 
+type mappingPair struct {
+	key *yaml.Node
+	val *yaml.Node
+}
+
+func expandMappingPairs(node *yaml.Node, visited map[*yaml.Node]bool) ([]mappingPair, error) {
+	node = derefAlias(node)
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("expected mapping node")
+	}
+	if visited == nil {
+		visited = make(map[*yaml.Node]bool)
+	}
+	if visited[node] {
+		return nil, nil
+	}
+	visited[node] = true
+	defer delete(visited, node)
+
+	var explicit []mappingPair
+	explicitKeys := make(map[string]bool, len(node.Content)/2)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		kNode := derefAlias(node.Content[i])
+		vNode := derefAlias(node.Content[i+1])
+		if kNode.Tag == "!!merge" {
+			continue
+		}
+		explicit = append(explicit, mappingPair{key: kNode, val: vNode})
+		explicitKeys[kNode.Value] = true
+	}
+
+	var result []mappingPair
+	mergedSeen := make(map[string]bool)
+	appendMerged := func(subNode *yaml.Node) error {
+		subPairs, err := expandMappingPairs(subNode, visited)
+		if err != nil {
+			return err
+		}
+		for _, p := range subPairs {
+			if explicitKeys[p.key.Value] || mergedSeen[p.key.Value] {
+				continue
+			}
+			mergedSeen[p.key.Value] = true
+			result = append(result, p)
+		}
+		return nil
+	}
+
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		kNode := derefAlias(node.Content[i])
+		if kNode.Tag != "!!merge" {
+			continue
+		}
+		vNode := derefAlias(node.Content[i+1])
+		switch vNode.Kind {
+		case yaml.MappingNode:
+			if err := appendMerged(vNode); err != nil {
+				return nil, err
+			}
+		case yaml.SequenceNode:
+			for _, elem := range vNode.Content {
+				elem = derefAlias(elem)
+				if elem.Kind == yaml.ScalarNode && elem.Tag == "!!null" {
+					continue
+				}
+				if elem.Kind != yaml.MappingNode {
+					return nil, fmt.Errorf("invalid yaml merge element: expected mapping")
+				}
+				if err := appendMerged(elem); err != nil {
+					return nil, err
+				}
+			}
+		case yaml.ScalarNode:
+			if vNode.Tag != "!!null" {
+				return nil, fmt.Errorf("invalid yaml merge value: expected mapping or sequence of mappings")
+			}
+		default:
+			return nil, fmt.Errorf("invalid yaml merge value: expected mapping or sequence of mappings")
+		}
+	}
+
+	if len(explicit) > 0 {
+		lastIdx := make(map[string]int, len(explicit))
+		for idx, p := range explicit {
+			lastIdx[p.key.Value] = idx
+		}
+		for idx, p := range explicit {
+			if lastIdx[p.key.Value] == idx {
+				result = append(result, p)
+			}
+		}
+	}
+
+	return result, nil
+}
+
 type BuildArgs map[string]string
 
 func (a *BuildArgs) UnmarshalYAML(value *yaml.Node) error {
@@ -40,10 +136,14 @@ func (a *BuildArgs) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	}
 	if value.Kind == yaml.MappingNode {
-		m := make(BuildArgs, len(value.Content)/2)
-		for i := 0; i+1 < len(value.Content); i += 2 {
-			kNode := derefAlias(value.Content[i])
-			vNode := derefAlias(value.Content[i+1])
+		pairs, err := expandMappingPairs(value, nil)
+		if err != nil {
+			return err
+		}
+		m := make(BuildArgs, len(pairs))
+		for _, p := range pairs {
+			kNode := p.key
+			vNode := p.val
 			if vNode.Kind == yaml.ScalarNode && vNode.Tag == "!!null" {
 				m[kNode.Value] = envPassthroughSentinel
 				continue
@@ -196,10 +296,14 @@ func (e *ExtraHosts) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	}
 	if value.Kind == yaml.MappingNode {
-		hosts := make(ExtraHosts, 0, len(value.Content)/2)
-		for i := 0; i+1 < len(value.Content); i += 2 {
-			kNode := derefAlias(value.Content[i])
-			vNode := derefAlias(value.Content[i+1])
+		pairs, err := expandMappingPairs(value, nil)
+		if err != nil {
+			return err
+		}
+		hosts := make(ExtraHosts, 0, len(pairs))
+		for _, p := range pairs {
+			kNode := p.key
+			vNode := p.val
 			host := strings.TrimSpace(kNode.Value)
 			if host == "" {
 				continue
@@ -330,10 +434,14 @@ func (e *EnvironmentMap) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	if value.Kind == yaml.MappingNode {
-		m := make(EnvironmentMap, len(value.Content)/2)
-		for i := 0; i+1 < len(value.Content); i += 2 {
-			kNode := derefAlias(value.Content[i])
-			vNode := derefAlias(value.Content[i+1])
+		pairs, err := expandMappingPairs(value, nil)
+		if err != nil {
+			return err
+		}
+		m := make(EnvironmentMap, len(pairs))
+		for _, p := range pairs {
+			kNode := p.key
+			vNode := p.val
 			if vNode.Kind == yaml.ScalarNode && vNode.Tag == "!!null" {
 				m[kNode.Value] = envPassthroughSentinel
 				continue
@@ -395,6 +503,28 @@ func parseShortVolume(spec string) VolumeMount {
 	}
 }
 
+func isWindowsDriveVolumePrefix(spec string) bool {
+	if len(spec) < 3 || spec[1] != ':' {
+		return false
+	}
+	ch := spec[0]
+	if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
+		return false
+	}
+	if spec[2] == '\\' {
+		return true
+	}
+	if spec[2] != '/' {
+		return false
+	}
+	nextColon := strings.IndexByte(spec[2:], ':')
+	if nextColon < 0 {
+		return false
+	}
+	after := spec[2+nextColon+1:]
+	return len(after) > 0 && (after[0] == '/' || after[0] == '\\')
+}
+
 func splitVolumeSpec(spec string) []string {
 	var parts []string
 	start := 0
@@ -402,10 +532,8 @@ func splitVolumeSpec(spec string) []string {
 		if spec[i] != ':' {
 			continue
 		}
-		if i == 1 && start == 0 && ((spec[0] >= 'a' && spec[0] <= 'z') || (spec[0] >= 'A' && spec[0] <= 'Z')) {
-			if i+1 < len(spec) && (spec[i+1] == '\\' || spec[i+1] == '/') {
-				continue
-			}
+		if i == 1 && start == 0 && isWindowsDriveVolumePrefix(spec) {
+			continue
 		}
 		parts = append(parts, spec[start:i])
 		start = i + 1
@@ -456,10 +584,14 @@ func (n *ServiceNetworks) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	if value.Kind == yaml.MappingNode {
-		m := make(ServiceNetworks, len(value.Content)/2)
-		for i := 0; i+1 < len(value.Content); i += 2 {
-			kNode := derefAlias(value.Content[i])
-			vNode := derefAlias(value.Content[i+1])
+		pairs, err := expandMappingPairs(value, nil)
+		if err != nil {
+			return err
+		}
+		m := make(ServiceNetworks, len(pairs))
+		for _, p := range pairs {
+			kNode := p.key
+			vNode := p.val
 			var cfg ServiceNetworkConfig
 			if vNode.Kind != yaml.ScalarNode || vNode.Tag != "!!null" {
 				if err := vNode.Decode(&cfg); err != nil {
@@ -542,10 +674,14 @@ func (d *DependsOnConfig) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	if value.Kind == yaml.MappingNode {
-		m := make(DependsOnConfig, len(value.Content)/2)
-		for i := 0; i+1 < len(value.Content); i += 2 {
-			kNode := derefAlias(value.Content[i])
-			vNode := derefAlias(value.Content[i+1])
+		pairs, err := expandMappingPairs(value, nil)
+		if err != nil {
+			return err
+		}
+		m := make(DependsOnConfig, len(pairs))
+		for _, p := range pairs {
+			kNode := p.key
+			vNode := p.val
 			var cond DependencyCondition
 			if vNode.Kind != yaml.ScalarNode || vNode.Tag != "!!null" {
 				if err := vNode.Decode(&cond); err != nil {

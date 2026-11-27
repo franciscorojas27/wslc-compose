@@ -6,13 +6,52 @@ import (
 )
 
 func TestAllSubcommandsMergeFlagsAndHelp(t *testing.T) {
+	t.Cleanup(func() {
+		if f := rootCmd.Flags().Lookup("help"); f != nil {
+			_ = f.Value.Set("false")
+			f.Changed = false
+		}
+		if f := rootCmd.PersistentFlags().Lookup("help"); f != nil {
+			_ = f.Value.Set("false")
+			f.Changed = false
+		}
+		for _, c := range rootCmd.Commands() {
+			if f := c.Flags().Lookup("help"); f != nil {
+				_ = f.Value.Set("false")
+				f.Changed = false
+			}
+		}
+		rootCmd.SetOut(nil)
+		rootCmd.SetErr(nil)
+		rootCmd.SetArgs(nil)
+	})
+
 	subcommands := rootCmd.Commands()
 	if len(subcommands) == 0 {
 		t.Fatalf("expected subcommands to be registered on rootCmd")
 	}
 
 	for _, sub := range subcommands {
+		sub := sub
 		t.Run(sub.Name(), func(t *testing.T) {
+			t.Cleanup(func() {
+				if f := sub.Flags().Lookup("help"); f != nil {
+					_ = f.Value.Set("false")
+					f.Changed = false
+				}
+				if f := rootCmd.Flags().Lookup("help"); f != nil {
+					_ = f.Value.Set("false")
+					f.Changed = false
+				}
+				if f := rootCmd.PersistentFlags().Lookup("help"); f != nil {
+					_ = f.Value.Set("false")
+					f.Changed = false
+				}
+				rootCmd.SetOut(nil)
+				rootCmd.SetErr(nil)
+				rootCmd.SetArgs(nil)
+			})
+
 			defer func() {
 				if r := recover(); r != nil {
 					t.Fatalf("subcommand %q panicked during flag merge or help: %v", sub.Name(), r)
