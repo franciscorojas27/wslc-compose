@@ -83,13 +83,14 @@ func Run(ctx context.Context, cfg config.ComposeFile, service string, command []
 		return err
 	}
 
-	networkNames := managedNetworkNames(cfg.Networks)
-	volumeNames := managedVolumeNames(cfg.Volumes)
+	effectiveCfg := withDefaultNetwork(cfg, map[string]config.Service{service: svc})
+	networkNames := managedNetworkNames(effectiveCfg.Networks)
+	volumeNames := managedVolumeNames(effectiveCfg.Volumes)
 
-	if err := createManagedNetworks(ctx, cfg, networkNames, nil, nil); err != nil {
+	if err := createManagedNetworks(ctx, effectiveCfg, networkNames, nil, nil); err != nil {
 		return err
 	}
-	if err := createManagedVolumes(ctx, cfg, volumeNames, nil, nil); err != nil {
+	if err := createManagedVolumes(ctx, effectiveCfg, volumeNames, nil, nil); err != nil {
 		return err
 	}
 
@@ -102,18 +103,29 @@ func Run(ctx context.Context, cfg config.ComposeFile, service string, command []
 		}); err != nil {
 			return err
 		}
+		for _, dep := range deps {
+			depCond := svc.DependsOn[dep].Condition
+			if depCond != "" && depCond != "service_started" {
+				if depSvc, exists := cfg.Services[dep]; exists {
+					if err := WaitForCondition(ctx, cfg.ContainerName(dep), depSvc, depCond); err != nil {
+						return err
+					}
+				}
+			}
+		}
 	}
 
 	puller := newImagePuller()
-	image, err := prepareServiceImage(ctx, cfg, service, svc, UpOptions{}, "svc:"+service, nil, puller)
+	image, err := prepareServiceImage(ctx, effectiveCfg, service, svc, UpOptions{}, "svc:"+service, nil, puller)
 	if err != nil {
 		return err
 	}
 
-	oneOffName := fmt.Sprintf("%s-%s-run-%s", cfg.ProjectName(), service, randomHex(4))
+	oneOffName := fmt.Sprintf("%s-%s-run-%s", effectiveCfg.ProjectName(), service, randomHex(4))
 	overrides := containerRunOverrides{
 		Detach:        opt.Detach,
 		AutoRemove:    opt.Remove,
+		SkipRestart:   true,
 		Interactive:   !opt.Detach,
 		AllocateTTY:   !opt.Detach && isStdinTTY(),
 		SkipPorts:     true,
@@ -126,9 +138,9 @@ func Run(ctx context.Context, cfg config.ComposeFile, service string, command []
 		HasCommand:    len(command) > 0,
 	}
 
-	attachments := resolveNetworkAttachments(cfg, service, svc)
+	attachments := resolveNetworkAttachments(effectiveCfg, service, svc)
 	if len(attachments) <= 1 {
-		args := buildContainerRunArgs(cfg, service, oneOffName, svc, image, overrides)
+		args := buildContainerRunArgs(effectiveCfg, service, oneOffName, svc, image, overrides)
 		if opt.Detach {
 			out, runErr := RunWSLC(ctx, args...)
 			if runErr != nil {
@@ -144,7 +156,7 @@ func Run(ctx context.Context, cfg config.ComposeFile, service string, command []
 		return RunWSLCInteractive(ctx, args...)
 	}
 
-	createArgs := buildContainerCreateArgs(cfg, service, oneOffName, svc, image, &attachments[0], overrides)
+	createArgs := buildContainerCreateArgs(effectiveCfg, service, oneOffName, svc, image, &attachments[0], overrides)
 	res, createErr := RunWSLC(ctx, createArgs...)
 	if createErr != nil {
 		return fmt.Errorf("failed to create container for service %q: %w", service, createErr)
@@ -155,30 +167,26 @@ func Run(ctx context.Context, cfg config.ComposeFile, service string, command []
 		target = oneOffName
 	}
 
-	if opt.Remove {
-		defer func() {
-			_ = StopAndRemoveContainer(context.Background(), target)
-		}()
-	}
-
 	for _, att := range attachments[1:] {
 		if err := ConnectNetwork(ctx, att, target); err != nil {
-			if !opt.Remove {
-				_ = StopAndRemoveContainer(context.Background(), target)
-			}
+			_ = StopAndRemoveContainer(context.Background(), target)
 			return err
 		}
 	}
 
 	if opt.Detach {
 		if err := StartExistingContainer(ctx, target); err != nil {
-			if !opt.Remove {
-				_ = StopAndRemoveContainer(context.Background(), target)
-			}
+			_ = StopAndRemoveContainer(context.Background(), target)
 			return err
 		}
 		fmt.Fprintln(stdout(), target)
 		return nil
+	}
+
+	if opt.Remove {
+		defer func() {
+			_ = StopAndRemoveContainer(context.Background(), target)
+		}()
 	}
 
 	return RunWSLCInteractive(ctx, "start", "-a", "-i", target)

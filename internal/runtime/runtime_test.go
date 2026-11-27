@@ -439,7 +439,7 @@ func TestUpForegroundStreamsLogsAndStopsInReverseOrderOnCancel(t *testing.T) {
 	}
 
 	output := outBuf.String()
-	finishIdx := strings.Index(output, "[+] Running 2/2")
+	finishIdx := strings.Index(output, "[+] Running 3/3")
 	attachIdx := strings.Index(output, "Attaching to api, db")
 	if finishIdx < 0 || attachIdx < 0 || finishIdx >= attachIdx {
 		t.Fatalf("expected progress UI to finish before attaching to logs, got output:\n%s", output)
@@ -1078,4 +1078,238 @@ func TestCreateVolumeArgsDriverOptsLabelsAndExternal(t *testing.T) {
 			t.Fatalf("expected created=false res='demo_data', got created=%v res=%q", created, res)
 		}
 	})
+}
+
+func TestUpSkipsRecreateWhenRunningUpToDateAndHandlesCompletedDep(t *testing.T) {
+	cfg := config.ComposeFile{
+		Name: "demo",
+		Services: map[string]config.Service{
+			"init": {Image: "alpine:latest"},
+			"web": {
+				Image:     "nginx:alpine",
+				DependsOn: config.DependsOnConfig{"init": {Condition: "service_completed_successfully"}},
+			},
+		},
+	}
+
+	t.Run("skips recreating up-to-date running container and exited-0 completed dep", func(t *testing.T) {
+		var (
+			mu       sync.Mutex
+			runCalls []string
+		)
+		withMockRuntime(
+			t,
+			func(ctx context.Context, args ...string) (string, error) {
+				if len(args) >= 2 && args[0] == "inspect" {
+					target := args[len(args)-1]
+					if target == "demo-init-1" {
+						return "exited||0|alpine:latest|", nil
+					}
+					if target == "demo-web-1" {
+						return "running||0|nginx:alpine|", nil
+					}
+				}
+				if len(args) > 0 && (args[0] == "run" || args[0] == "start") {
+					mu.Lock()
+					runCalls = append(runCalls, strings.Join(args, " "))
+					mu.Unlock()
+				}
+				return "ok", nil
+			},
+			func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+				return "", nil
+			},
+		)
+
+		if err := Up(context.Background(), cfg, UpOptions{Detach: true}); err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+		if len(runCalls) != 0 {
+			t.Fatalf("expected no container recreation/relaunch, got calls: %v", runCalls)
+		}
+	})
+
+	t.Run("recreates when image changes or force-recreate is set", func(t *testing.T) {
+		var (
+			mu      sync.Mutex
+			started []string
+		)
+		withMockRuntime(
+			t,
+			func(ctx context.Context, args ...string) (string, error) {
+				if len(args) >= 2 && args[0] == "inspect" {
+					target := args[len(args)-1]
+					if target == "demo-init-1" {
+						return "exited||0|alpine:latest|", nil
+					}
+					if target == "demo-web-1" {
+						return "running||0|nginx:1.24-alpine|", nil
+					}
+				}
+				if len(args) > 0 && args[0] == "run" {
+					mu.Lock()
+					started = append(started, extractContainerNameFromRunArgs(args))
+					mu.Unlock()
+				}
+				return "ok", nil
+			},
+			func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+				return "", nil
+			},
+		)
+
+		if err := Up(context.Background(), cfg, UpOptions{Detach: true}); err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+		if !reflect.DeepEqual(started, []string{"demo-web-1"}) {
+			t.Fatalf("expected only changed web container recreated, got: %v", started)
+		}
+	})
+}
+
+func TestStartAndRestartRespectDependsOnOrderAndHealth(t *testing.T) {
+	cfg := config.ComposeFile{
+		Name: "demo",
+		Services: map[string]config.Service{
+			"db": {
+				Image: "postgres:16-alpine",
+				HealthCheck: &config.HealthCheck{
+					Test:     config.HealthCheckTest{"CMD", "pg_isready"},
+					Interval: "5ms",
+					Retries:  2,
+				},
+			},
+			"api": {
+				Image:     "golang:alpine",
+				DependsOn: config.DependsOnConfig{"db": {Condition: "service_healthy"}},
+			},
+		},
+	}
+
+	var (
+		mu     sync.Mutex
+		events []string
+	)
+	withMockRuntime(
+		t,
+		func(ctx context.Context, args ...string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if len(args) >= 2 && args[0] == "inspect" {
+				return "running||0", nil
+			}
+			if len(args) >= 2 && args[0] == "exec" {
+				events = append(events, "probe:"+args[1])
+				return "ok", nil
+			}
+			if len(args) >= 2 && (args[0] == "start" || args[0] == "stop") {
+				events = append(events, args[0]+":"+args[len(args)-1])
+			}
+			return "ok", nil
+		},
+		func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+			return "", nil
+		},
+	)
+
+	if err := Start(context.Background(), cfg, nil); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	wantStart := []string{"start:demo-db-1", "probe:demo-db-1", "start:demo-api-1"}
+	if !reflect.DeepEqual(events, wantStart) {
+		t.Fatalf("got start sequence %v, want %v", events, wantStart)
+	}
+
+	events = nil
+	if err := Restart(context.Background(), cfg, nil); err != nil {
+		t.Fatalf("Restart failed: %v", err)
+	}
+	wantRestart := []string{"stop:demo-api-1", "stop:demo-db-1", "start:demo-db-1", "probe:demo-db-1", "start:demo-api-1"}
+	if !reflect.DeepEqual(events, wantRestart) {
+		t.Fatalf("got restart sequence %v, want %v", events, wantRestart)
+	}
+}
+
+func TestRunSkipsRestartPolicyAndClearsCommandOnEntrypointOverride(t *testing.T) {
+	cfg := config.ComposeFile{Name: "demo"}
+	svc := config.Service{
+		Image:   "alpine:latest",
+		Restart: "always",
+		Command: config.StringOrSlice{"server", "--port", "8080"},
+	}
+
+	args := buildContainerRunArgs(cfg, "api", "demo-api-run-1", svc, svc.Image, containerRunOverrides{
+		SkipRestart:   true,
+		HasEntrypoint: true,
+		Entrypoint:    "/bin/sh",
+	})
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--restart") {
+		t.Fatalf("one-off container must not inherit restart policy: %s", joined)
+	}
+	if strings.Contains(joined, "server") || strings.Contains(joined, "--port") {
+		t.Fatalf("entrypoint override without command must clear service.Command: %s", joined)
+	}
+	if !strings.Contains(joined, "--entrypoint /bin/sh") {
+		t.Fatalf("expected --entrypoint /bin/sh in args: %s", joined)
+	}
+}
+
+func TestScanStreamLinesPreservesIndentationAndEmptyLinesAndForegroundPropagatesLogsError(t *testing.T) {
+	var got []string
+	scanStreamLines(strings.NewReader("  indented\n\n\tsecond\n"), func(s string) {
+		got = append(got, s)
+	})
+	want := []string{"  indented", "", "\tsecond"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got scanned lines %#v, want %#v", got, want)
+	}
+
+	cfg := config.ComposeFile{
+		Name: "demo",
+		Services: map[string]config.Service{
+			"web": {Image: "nginx:alpine"},
+		},
+	}
+	withMockRuntime(
+		t,
+		func(ctx context.Context, args ...string) (string, error) {
+			return "ok", nil
+		},
+		func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+			return "", errors.New("log stream broken")
+		},
+	)
+	err := Up(context.Background(), cfg, UpOptions{Detach: false})
+	if err == nil || !strings.Contains(err.Error(), "log stream broken") {
+		t.Fatalf("expected foreground Up to propagate Logs error, got: %v", err)
+	}
+}
+
+func TestUpPropagatesOrphanRemovalError(t *testing.T) {
+	withMockRuntime(
+		t,
+		func(ctx context.Context, args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "ps" {
+				return "111\tdemo-old-1\talpine\tUp 5s\t\tcom.wslc.compose.project=demo,com.wslc.compose.service=old", nil
+			}
+			if len(args) > 0 && args[0] == "remove" && args[len(args)-1] == "demo-old-1" {
+				return "", errors.New("permission denied removing orphan")
+			}
+			return "ok", nil
+		},
+		func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+			return "", nil
+		},
+	)
+	cfg := config.ComposeFile{
+		Name: "demo",
+		Services: map[string]config.Service{
+			"web": {Image: "nginx:alpine"},
+		},
+	}
+	err := Up(context.Background(), cfg, UpOptions{Detach: true, RemoveOrphans: true})
+	if err == nil || !strings.Contains(err.Error(), "permission denied removing orphan") {
+		t.Fatalf("expected Up to propagate orphan removal error, got: %v", err)
+	}
 }

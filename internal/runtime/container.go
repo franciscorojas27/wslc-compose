@@ -2,10 +2,14 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,8 +17,9 @@ import (
 )
 
 const (
-	labelComposeProject = "com.wslc.compose.project"
-	labelComposeService = "com.wslc.compose.service"
+	labelComposeProject    = "com.wslc.compose.project"
+	labelComposeService    = "com.wslc.compose.service"
+	labelComposeConfigHash = "com.wslc.compose.config-hash"
 )
 
 type ContainerInfo struct {
@@ -27,15 +32,18 @@ type ContainerInfo struct {
 }
 
 type ContainerState struct {
-	Exists   bool
-	Status   string
-	Health   string
-	ExitCode int
+	Exists     bool
+	Status     string
+	Health     string
+	ExitCode   int
+	Image      string
+	ConfigHash string
 }
 
 type containerRunOverrides struct {
 	Detach        bool
 	AutoRemove    bool
+	SkipRestart   bool
 	Interactive   bool
 	AllocateTTY   bool
 	SkipPorts     bool
@@ -125,6 +133,9 @@ func validateServiceBindMounts(cfg config.ComposeFile, serviceName string, svc c
 		if !isBind {
 			continue
 		}
+		if goruntime.GOOS == "windows" && strings.HasPrefix(hostPath, "/") {
+			continue
+		}
 		if _, err := os.Stat(hostPath); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("bind mount source %q for service %q does not exist", hostPath, serviceName)
@@ -169,9 +180,55 @@ func looksLikeFileTarget(path string) bool {
 	}
 }
 
+func defaultProjectNetworkName(cfg config.ComposeFile) string {
+	if _, exists := cfg.Networks["default"]; exists {
+		return cfg.NetworkName("default")
+	}
+	return fmt.Sprintf("%s_default", cfg.ProjectName())
+}
+
+func needsDefaultNetwork(cfg config.ComposeFile, services map[string]config.Service) bool {
+	if cfg.Name == "" && cfg.BaseDir == "" && cfg.ProjectDir == "" && len(services) == 0 {
+		return false
+	}
+	for _, svc := range services {
+		if len(svc.Networks) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func withDefaultNetwork(cfg config.ComposeFile, services map[string]config.Service) config.ComposeFile {
+	if !needsDefaultNetwork(cfg, services) {
+		return cfg
+	}
+	if _, exists := cfg.Networks["default"]; exists {
+		return cfg
+	}
+	out := cfg
+	nets := make(map[string]config.Network, len(cfg.Networks)+1)
+	for k, v := range cfg.Networks {
+		nets[k] = v
+	}
+	nets["default"] = config.Network{}
+	out.Networks = nets
+	return out
+}
+
 func resolveNetworkAttachments(cfg config.ComposeFile, serviceName string, service config.Service) []NetworkAttachment {
 	if len(service.Networks) == 0 {
-		return nil
+		if cfg.Name == "" && cfg.BaseDir == "" && cfg.ProjectDir == "" && len(cfg.Services) == 0 {
+			return nil
+		}
+		var aliases []string
+		if serviceName != "" {
+			aliases = []string{serviceName}
+		}
+		return []NetworkAttachment{{
+			Network: defaultProjectNetworkName(cfg),
+			Aliases: aliases,
+		}}
 	}
 
 	netKeys := service.Networks.SortedNames()
@@ -204,6 +261,24 @@ func resolveNetworkAttachments(cfg config.ComposeFile, serviceName string, servi
 	return attachments
 }
 
+func computeServiceConfigHash(cfg config.ComposeFile, serviceName string, svc config.Service, image string) string {
+	payload := struct {
+		ServiceName string
+		Image       string
+		Service     config.Service
+	}{
+		ServiceName: serviceName,
+		Image:       image,
+		Service:     svc,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:8])
+}
+
 func buildContainerRunArgs(cfg config.ComposeFile, serviceName string, containerName string, service config.Service, image string, ov containerRunOverrides) []string {
 	attachments := resolveNetworkAttachments(cfg, serviceName, service)
 	var primary *NetworkAttachment
@@ -230,7 +305,7 @@ func buildContainerArgs(subcmd string, cfg config.ComposeFile, serviceName strin
 		args = append(args, "--name", containerName)
 	}
 
-	if service.Restart != "" && !ov.AutoRemove {
+	if service.Restart != "" && !ov.AutoRemove && !ov.SkipRestart {
 		args = append(args, "--restart", service.Restart)
 	}
 
@@ -301,11 +376,12 @@ func buildContainerArgs(subcmd string, cfg config.ComposeFile, serviceName strin
 	for k, v := range service.Environment {
 		envMap[k] = v
 	}
+	var bareEnv []string
 	for _, entry := range ov.Env {
 		if k, v, ok := strings.Cut(entry, "="); ok {
 			envMap[k] = v
 		} else if entry != "" {
-			args = append(args, "-e", entry)
+			bareEnv = append(bareEnv, entry)
 		}
 	}
 	if len(envMap) > 0 {
@@ -318,8 +394,11 @@ func buildContainerArgs(subcmd string, cfg config.ComposeFile, serviceName strin
 			args = append(args, "-e", k+"="+envMap[k])
 		}
 	}
+	for _, entry := range bareEnv {
+		args = append(args, "-e", entry)
+	}
 
-	labels := make(map[string]string, len(service.Labels)+2)
+	labels := make(map[string]string, len(service.Labels)+3)
 	for k, v := range service.Labels {
 		labels[k] = v
 	}
@@ -328,6 +407,11 @@ func buildContainerArgs(subcmd string, cfg config.ComposeFile, serviceName strin
 	}
 	if serviceName != "" {
 		labels[labelComposeService] = serviceName
+	}
+	if !ov.SkipRestart && serviceName != "" {
+		if hash := computeServiceConfigHash(cfg, serviceName, service, image); hash != "" {
+			labels[labelComposeConfigHash] = hash
+		}
 	}
 	if len(labels) > 0 {
 		labelKeys := make([]string, 0, len(labels))
@@ -400,7 +484,7 @@ func buildContainerArgs(subcmd string, cfg config.ComposeFile, serviceName strin
 
 	if ov.HasCommand {
 		trailingArgs = append(trailingArgs, ov.Command...)
-	} else if len(service.Command) > 0 {
+	} else if !ov.HasEntrypoint && len(service.Command) > 0 {
 		trailingArgs = append(trailingArgs, service.Command...)
 	}
 
@@ -435,7 +519,9 @@ func formatHealthCmd(test config.HealthCheckTest) string {
 	if len(test) == 0 {
 		return ""
 	}
-	switch strings.ToUpper(test[0]) {
+	switch strings.ToUpper(strings.TrimSpace(test[0])) {
+	case "NONE":
+		return ""
 	case "CMD-SHELL":
 		if len(test) > 1 {
 			return strings.Join(test[1:], " ")
@@ -443,12 +529,40 @@ func formatHealthCmd(test config.HealthCheckTest) string {
 		return ""
 	case "CMD":
 		if len(test) > 1 {
-			return strings.Join(test[1:], " ")
+			quoted := make([]string, 0, len(test)-1)
+			for _, arg := range test[1:] {
+				quoted = append(quoted, shellQuoteArg(arg))
+			}
+			return strings.Join(quoted, " ")
 		}
 		return ""
 	default:
-		return strings.Join(test, " ")
+		quoted := make([]string, 0, len(test))
+		for _, arg := range test {
+			quoted = append(quoted, shellQuoteArg(arg))
+		}
+		return strings.Join(quoted, " ")
 	}
+}
+
+func shellQuoteArg(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+	needsQuote := false
+	for i := 0; i < len(arg); i++ {
+		c := arg[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' || c == '/' || c == ':' || c == '=' || c == '+' || c == ',' || c == '@' {
+			continue
+		}
+		needsQuote = true
+		break
+	}
+	if !needsQuote {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
 func StartExistingContainer(ctx context.Context, name string) error {

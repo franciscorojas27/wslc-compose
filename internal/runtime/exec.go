@@ -53,10 +53,7 @@ func runWSLC(ctx context.Context, args ...string) (string, error) {
 		return "", classifyWSLCError(rawErr, err)
 	}
 
-	if stdout != "" {
-		return stdout, nil
-	}
-	return stderr, nil
+	return stdout, nil
 }
 
 func RunWSLCInteractive(ctx context.Context, args ...string) error {
@@ -107,14 +104,13 @@ func runWSLCStream(ctx context.Context, onLine func(string), args ...string) (st
 
 	consume := func(r io.Reader, isStderr bool) {
 		defer wg.Done()
-		readStreamLines(r, func(rawLine string) {
-			line := strings.TrimSpace(stripANSI(rawLine))
-			if line == "" {
-				return
-			}
+		scanStreamLines(r, func(rawLine string) {
+			line := stripANSI(rawLine)
 			mu.Lock()
 			if isStderr {
-				stderrLines = appendBoundedLine(stderrLines, line, maxBufferedStreamLines)
+				if strings.TrimSpace(line) != "" {
+					stderrLines = appendBoundedLine(stderrLines, line, maxBufferedStreamLines)
+				}
 			} else {
 				stdoutLines = appendBoundedLine(stdoutLines, line, maxBufferedStreamLines)
 			}
@@ -140,6 +136,14 @@ func runWSLCStream(ctx context.Context, onLine func(string), args ...string) (st
 	}
 
 	return strings.TrimSpace(strings.Join(stdoutLines, "\n")), nil
+}
+
+func scanStreamLines(r io.Reader, handle func(string)) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxStreamLineBytes)
+	for scanner.Scan() {
+		handle(scanner.Text())
+	}
 }
 
 func readStreamLines(r io.Reader, handle func(string)) {
@@ -223,6 +227,9 @@ func selectErrorRaw(stderrLines, stdoutLines []string) string {
 
 	var nonProgress []string
 	for _, line := range candidates {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
 		if !isProgressOnlyLine(line) {
 			nonProgress = append(nonProgress, line)
 		}
@@ -231,7 +238,12 @@ func selectErrorRaw(stderrLines, stdoutLines []string) string {
 		return strings.Join(nonProgress, "\n")
 	}
 
-	return candidates[len(candidates)-1]
+	for i := len(candidates) - 1; i >= 0; i-- {
+		if strings.TrimSpace(candidates[i]) != "" {
+			return candidates[i]
+		}
+	}
+	return ""
 }
 
 func isProgressOnlyLine(line string) bool {
@@ -249,26 +261,48 @@ func stripANSI(s string) string {
 }
 
 func classifyWSLCError(raw string, fallback error) error {
-	if raw == "" {
+	trimmedRaw := strings.TrimSpace(raw)
+	if trimmedRaw == "" {
 		return fallback
 	}
 
-	errRaw := strings.Split(raw, "\n")
-	headline := strings.TrimSpace(errRaw[0])
-	lower := strings.ToLower(raw)
+	rawLines := strings.Split(trimmedRaw, "\n")
+	var allLines []string
+	var nonLayerLines []string
+	for _, l := range rawLines {
+		t := strings.TrimSpace(l)
+		if t == "" {
+			continue
+		}
+		allLines = append(allLines, t)
+		if !layerIDRe.MatchString(t) {
+			nonLayerLines = append(nonLayerLines, t)
+		}
+	}
+
+	fullMsg := strings.Join(allLines, "\n")
+	if fullMsg == "" {
+		return fallback
+	}
+
+	classifySource := nonLayerLines
+	if len(classifySource) == 0 {
+		classifySource = allLines
+	}
+	lower := strings.ToLower(strings.Join(classifySource, "\n"))
 
 	switch {
-	case strings.Contains(lower, "error_already_exists"),
-		strings.Contains(lower, "already exists"):
-		return fmt.Errorf("%w: %s", ErrAlreadyExists, headline)
+	case (strings.Contains(lower, "error_already_exists") || strings.Contains(lower, "already exists")) &&
+		!strings.Contains(lower, "denied") && !strings.Contains(lower, "unauthorized"):
+		return fmt.Errorf("%w: %s", ErrAlreadyExists, fullMsg)
 	case strings.Contains(lower, "error_not_found"),
 		strings.Contains(lower, "error_file_not_found"),
 		strings.Contains(lower, "not found"),
 		strings.Contains(lower, "no such"),
 		strings.Contains(lower, "does not exist"),
 		strings.Contains(lower, "cannot find"):
-		return fmt.Errorf("%w: %s", ErrNotFound, headline)
+		return fmt.Errorf("%w: %s", ErrNotFound, fullMsg)
 	default:
-		return errors.New(headline)
+		return errors.New(fullMsg)
 	}
 }

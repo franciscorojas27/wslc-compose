@@ -409,7 +409,10 @@ func Images(ctx context.Context, cfg config.ComposeFile, targetServices []string
 		return err
 	}
 
-	localImages, _ := ListImages(ctx)
+	localImages, err := ListImages(ctx)
+	if err != nil {
+		return err
+	}
 
 	findLocal := func(ref string) (ImageInfo, bool) {
 		repo, tag := splitImageRef(ref)
@@ -476,26 +479,41 @@ func findOrphanContainers(ctx context.Context, cfg config.ComposeFile) []Contain
 		return nil
 	}
 
-	known := make(map[string]bool, len(cfg.Services))
-	for name := range cfg.Services {
-		known[cfg.ContainerName(name)] = true
-	}
-
 	proj := cfg.ProjectName()
-	prefix := proj + "-"
+	knownContainers := make(map[string]bool, len(cfg.Services)+len(cfg.AllServices))
+	knownServices := make(map[string]bool, len(cfg.Services)+len(cfg.AllServices))
+
+	for name, svc := range cfg.AllServices {
+		knownServices[name] = true
+		if svc.ContainerName != "" {
+			knownContainers[svc.ContainerName] = true
+		} else {
+			knownContainers[fmt.Sprintf("%s-%s-1", proj, name)] = true
+		}
+	}
+	for name := range cfg.Services {
+		knownServices[name] = true
+		knownContainers[cfg.ContainerName(name)] = true
+	}
 
 	var orphans []ContainerInfo
 	for _, c := range containers {
-		if c.Name == "" || known[c.Name] {
+		if c.Name == "" || knownContainers[c.Name] {
 			continue
 		}
-		belongs := false
-		if c.Labels != nil && c.Labels[labelComposeProject] == proj {
-			belongs = true
-		} else if strings.HasPrefix(c.Name, prefix) && strings.HasSuffix(c.Name, "-1") {
-			belongs = true
+		if c.Labels != nil {
+			if projLabel, ok := c.Labels[labelComposeProject]; ok && projLabel != "" {
+				if projLabel != proj {
+					continue
+				}
+				if svcLabel := c.Labels[labelComposeService]; svcLabel != "" && knownServices[svcLabel] {
+					continue
+				}
+				orphans = append(orphans, c)
+				continue
+			}
 		}
-		if belongs {
+		if parsedSvc, ok := matchStrictProjectContainerName(c.Name, proj); ok && !knownServices[parsedSvc] {
 			orphans = append(orphans, c)
 		}
 	}
@@ -504,6 +522,25 @@ func findOrphanContainers(ctx context.Context, cfg config.ComposeFile) []Contain
 		return orphans[i].Name < orphans[j].Name
 	})
 	return orphans
+}
+
+func matchStrictProjectContainerName(name string, proj string) (string, bool) {
+	prefix := proj + "-"
+	if !strings.HasPrefix(name, prefix) {
+		return "", false
+	}
+	rest := strings.TrimPrefix(name, prefix)
+	lastDash := strings.LastIndex(rest, "-")
+	if lastDash <= 0 || lastDash+1 >= len(rest) {
+		return "", false
+	}
+	numPart := rest[lastDash+1:]
+	for i := 0; i < len(numPart); i++ {
+		if numPart[i] < '0' || numPart[i] > '9' {
+			return "", false
+		}
+	}
+	return rest[:lastDash], true
 }
 
 func removeOrphanContainers(ctx context.Context, orphans []ContainerInfo, ui *progressUI, recordErr func(error)) {

@@ -22,13 +22,14 @@ type LoadOptions struct {
 }
 
 type ComposeFile struct {
-	Name       string             `yaml:"name,omitempty"`
-	Services   map[string]Service `yaml:"services"`
-	Networks   map[string]Network `yaml:"networks,omitempty"`
-	Volumes    map[string]Volume  `yaml:"volumes,omitempty"`
-	BaseDir    string             `yaml:"-"`
-	ProjectDir string             `yaml:"-"`
-	FilePath   string             `yaml:"-"`
+	Name        string             `yaml:"name,omitempty"`
+	Services    map[string]Service `yaml:"services"`
+	Networks    map[string]Network `yaml:"networks,omitempty"`
+	Volumes     map[string]Volume  `yaml:"volumes,omitempty"`
+	AllServices map[string]Service `yaml:"-"`
+	BaseDir     string             `yaml:"-"`
+	ProjectDir  string             `yaml:"-"`
+	FilePath    string             `yaml:"-"`
 }
 
 type IPAMConfig struct {
@@ -207,6 +208,12 @@ func Load(explicitPath string, opts ...LoadOptions) (ComposeFile, error) {
 		projectName = filepath.Base(baseDir)
 	}
 	cfg.Name = SanitizeProjectName(projectName)
+
+	allServices := make(map[string]Service, len(cfg.Services))
+	for name, svc := range cfg.Services {
+		allServices[name] = svc
+	}
+	cfg.AllServices = allServices
 
 	activeProfiles := collectActiveProfiles(opt.Profiles, lookup)
 	if len(activeProfiles) > 0 {
@@ -855,6 +862,9 @@ func (c ComposeFile) FilterByProfiles(activeProfiles []string, explicitServices 
 	}
 
 	out := c
+	if len(out.AllServices) == 0 {
+		out.AllServices = c.Services
+	}
 	out.Services = filtered
 	return out
 }

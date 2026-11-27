@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -10,8 +11,22 @@ import (
 	"wslc-compose/internal/config"
 )
 
+type inspectStateDocument struct {
+	State struct {
+		Status   string `json:"Status"`
+		ExitCode int    `json:"ExitCode"`
+		Health   *struct {
+			Status string `json:"Status"`
+		} `json:"Health"`
+	} `json:"State"`
+	Config struct {
+		Image  string            `json:"Image"`
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+}
+
 func InspectContainerState(ctx context.Context, name string) (ContainerState, error) {
-	out, err := RunWSLC(ctx, "inspect", "--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.State.ExitCode}}", name)
+	out, err := RunWSLC(ctx, "inspect", "--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.State.ExitCode}}|{{if .Config}}{{.Config.Image}}|{{index .Config.Labels \"com.wslc.compose.config-hash\"}}{{end}}", name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return ContainerState{Exists: false}, nil
@@ -22,26 +37,57 @@ func InspectContainerState(ctx context.Context, name string) (ContainerState, er
 		}
 		for _, c := range containers {
 			if c.Name == name {
-				return parseStateFromStatusText(c.Status), nil
+				st := parseStateFromStatusText(c.Status)
+				st.Image = c.Image
+				if c.Labels != nil {
+					st.ConfigHash = c.Labels[labelComposeConfigHash]
+				}
+				return st, nil
 			}
 		}
 		return ContainerState{Exists: false}, nil
 	}
 
-	if strings.Contains(out, "{{.") {
+	trimmed := strings.TrimSpace(out)
+	if strings.Contains(trimmed, "{{.") {
 		containers, listErr := ListContainers(ctx)
 		if listErr != nil {
 			return ContainerState{Exists: true}, nil
 		}
 		for _, c := range containers {
 			if c.Name == name {
-				return parseStateFromStatusText(c.Status), nil
+				st := parseStateFromStatusText(c.Status)
+				st.Image = c.Image
+				if c.Labels != nil {
+					st.ConfigHash = c.Labels[labelComposeConfigHash]
+				}
+				return st, nil
 			}
 		}
 		return ContainerState{Exists: false}, nil
 	}
 
-	parts := strings.Split(strings.TrimSpace(out), "|")
+	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+		if st, ok := parseStateFromInspectJSON(trimmed); ok {
+			return st, nil
+		}
+		containers, listErr := ListContainers(ctx)
+		if listErr == nil {
+			for _, c := range containers {
+				if c.Name == name {
+					st := parseStateFromStatusText(c.Status)
+					st.Image = c.Image
+					if c.Labels != nil {
+						st.ConfigHash = c.Labels[labelComposeConfigHash]
+					}
+					return st, nil
+				}
+			}
+		}
+		return ContainerState{Exists: true}, nil
+	}
+
+	parts := strings.Split(trimmed, "|")
 	st := ContainerState{Exists: true}
 	if len(parts) > 0 {
 		st.Status = strings.ToLower(strings.TrimSpace(parts[0]))
@@ -54,7 +100,47 @@ func InspectContainerState(ctx context.Context, name string) (ContainerState, er
 			st.ExitCode = code
 		}
 	}
+	if len(parts) > 3 {
+		st.Image = strings.TrimSpace(parts[3])
+	}
+	if len(parts) > 4 {
+		val := strings.TrimSpace(parts[4])
+		if val != "<no value>" {
+			st.ConfigHash = val
+		}
+	}
 	return st, nil
+}
+
+func parseStateFromInspectJSON(raw string) (ContainerState, bool) {
+	var docs []inspectStateDocument
+	if err := json.Unmarshal([]byte(raw), &docs); err != nil {
+		var single inspectStateDocument
+		if singleErr := json.Unmarshal([]byte(raw), &single); singleErr != nil {
+			return ContainerState{}, false
+		}
+		docs = []inspectStateDocument{single}
+	}
+	for _, doc := range docs {
+		status := strings.ToLower(strings.TrimSpace(doc.State.Status))
+		if status == "" {
+			continue
+		}
+		st := ContainerState{
+			Exists:   true,
+			Status:   status,
+			ExitCode: doc.State.ExitCode,
+			Image:    strings.TrimSpace(doc.Config.Image),
+		}
+		if doc.State.Health != nil {
+			st.Health = strings.ToLower(strings.TrimSpace(doc.State.Health.Status))
+		}
+		if doc.Config.Labels != nil {
+			st.ConfigHash = strings.TrimSpace(doc.Config.Labels[labelComposeConfigHash])
+		}
+		return st, true
+	}
+	return ContainerState{}, false
 }
 
 func parseStateFromStatusText(status string) ContainerState {
@@ -95,6 +181,13 @@ func parseStateFromStatusText(status string) ContainerState {
 	}
 
 	return st
+}
+
+func isHealthCheckDisabled(hc *config.HealthCheck) bool {
+	if hc == nil || hc.Disable || len(hc.Test) == 0 {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(hc.Test[0]), "NONE")
 }
 
 func WaitForCondition(ctx context.Context, containerName string, svc config.Service, condition string) error {
@@ -144,6 +237,7 @@ func waitForHealthy(ctx context.Context, containerName string, svc config.Servic
 	interval := 1 * time.Second
 	retries := 30
 	var startPeriod time.Duration
+	var probeTimeout time.Duration
 
 	if svc.HealthCheck != nil {
 		if d, err := time.ParseDuration(svc.HealthCheck.Interval); err == nil && d > 0 {
@@ -154,6 +248,9 @@ func waitForHealthy(ctx context.Context, containerName string, svc config.Servic
 		}
 		if d, err := time.ParseDuration(svc.HealthCheck.StartPeriod); err == nil && d > 0 {
 			startPeriod = d
+		}
+		if d, err := time.ParseDuration(svc.HealthCheck.Timeout); err == nil && d > 0 {
+			probeTimeout = d
 		}
 	}
 
@@ -181,12 +278,12 @@ func waitForHealthy(ctx context.Context, containerName string, svc config.Servic
 		}
 
 		if st.Health == "" {
-			if svc.HealthCheck == nil || svc.HealthCheck.Disable || len(svc.HealthCheck.Test) == 0 {
+			if isHealthCheckDisabled(svc.HealthCheck) {
 				if st.Status == "running" {
 					return nil
 				}
 			} else if st.Status == "running" {
-				if runHealthProbe(ctx, containerName, svc.HealthCheck.Test) == nil {
+				if runHealthProbe(ctx, containerName, svc.HealthCheck.Test, probeTimeout) == nil {
 					return nil
 				}
 				if time.Now().After(deadline) {
@@ -206,9 +303,15 @@ func waitForHealthy(ctx context.Context, containerName string, svc config.Servic
 	}
 }
 
-func runHealthProbe(ctx context.Context, containerName string, test config.HealthCheckTest) error {
-	if len(test) == 0 {
+func runHealthProbe(ctx context.Context, containerName string, test config.HealthCheckTest, timeout time.Duration) error {
+	if len(test) == 0 || strings.EqualFold(strings.TrimSpace(test[0]), "NONE") {
 		return nil
+	}
+	probeCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		probeCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 	args := []string{"exec", containerName}
 	switch strings.ToUpper(test[0]) {
@@ -226,7 +329,7 @@ func runHealthProbe(ctx context.Context, containerName string, test config.Healt
 		args = append(args, test...)
 	}
 
-	_, err := RunWSLC(ctx, args...)
+	_, err := RunWSLC(probeCtx, args...)
 	return err
 }
 

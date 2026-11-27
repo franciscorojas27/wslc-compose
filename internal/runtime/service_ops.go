@@ -348,35 +348,74 @@ func createManagedVolumes(ctx context.Context, cfg config.ComposeFile, keys []st
 	return g.Wait()
 }
 
+func containerIsUpToDate(st ContainerState, expectedImage string, expectedHash string) bool {
+	if st.ConfigHash != "" && expectedHash != "" && st.ConfigHash != expectedHash {
+		return false
+	}
+	if st.Image != "" && expectedImage != "" {
+		stRepo, stTag := splitImageRef(st.Image)
+		expRepo, expTag := splitImageRef(expectedImage)
+		if trimRegistryPrefix(stRepo) != trimRegistryPrefix(expRepo) || stTag != expTag {
+			return false
+		}
+	}
+	return true
+}
+
 func startFloorService(ctx context.Context, cfg config.ComposeFile, name string, svc config.Service, opt UpOptions, waitCond string, ui *progressUI, state *rollbackState, puller *imagePuller) error {
 	id := "svc:" + name
 	containerName := cfg.ContainerName(name)
+	expectedImage := serviceImageTag(cfg, name, svc)
+	expectedHash := computeServiceConfigHash(cfg, name, svc, expectedImage)
 
-	if opt.NoRecreate {
+	if !opt.ForceRecreate {
 		st, err := InspectContainerState(ctx, containerName)
 		if err == nil && st.Exists {
-			if st.Status != "running" {
-				ui.setRunning(id, "Starting")
-				if startErr := StartExistingContainer(ctx, containerName); startErr != nil {
-					ui.setFailed(id, "Error")
-					return startErr
+			if waitCond == "service_completed_successfully" && st.Status == "exited" && st.ExitCode == 0 {
+				if opt.NoRecreate || (!opt.Build && containerIsUpToDate(st, expectedImage, expectedHash)) {
+					ui.setDone(id, "Completed")
+					return nil
 				}
 			}
-			if waitCond != "" && waitCond != "service_started" {
-				ui.setRunning(id, "Waiting")
-				if waitErr := WaitForCondition(ctx, containerName, svc, waitCond); waitErr != nil {
-					ui.setFailed(id, "Unhealthy")
-					return waitErr
+
+			if opt.NoRecreate {
+				if st.Status != "running" {
+					ui.setRunning(id, "Starting")
+					if startErr := StartExistingContainer(ctx, containerName); startErr != nil {
+						ui.setFailed(id, "Error")
+						return startErr
+					}
 				}
-				ui.setDone(id, "Healthy")
+				if waitCond != "" && waitCond != "service_started" {
+					ui.setRunning(id, "Waiting")
+					if waitErr := WaitForCondition(ctx, containerName, svc, waitCond); waitErr != nil {
+						ui.setFailed(id, "Unhealthy")
+						return waitErr
+					}
+					ui.setDone(id, "Healthy")
+					return nil
+				}
+				if st.Status == "running" {
+					ui.setDone(id, "Running")
+				} else {
+					ui.setDone(id, "Started")
+				}
 				return nil
 			}
-			if st.Status == "running" {
+
+			if !opt.Build && st.Status == "running" && containerIsUpToDate(st, expectedImage, expectedHash) {
+				if waitCond != "" && waitCond != "service_started" {
+					ui.setRunning(id, "Waiting")
+					if waitErr := WaitForCondition(ctx, containerName, svc, waitCond); waitErr != nil {
+						ui.setFailed(id, "Unhealthy")
+						return waitErr
+					}
+					ui.setDone(id, "Healthy")
+					return nil
+				}
 				ui.setDone(id, "Running")
-			} else {
-				ui.setDone(id, "Started")
+				return nil
 			}
-			return nil
 		}
 	}
 
@@ -482,7 +521,7 @@ func computeWaitConditions(services map[string]config.Service, waitAll bool) map
 
 	if waitAll {
 		for name, svc := range services {
-			if svc.HealthCheck != nil && !svc.HealthCheck.Disable && len(svc.HealthCheck.Test) > 0 {
+			if !isHealthCheckDisabled(svc.HealthCheck) {
 				if conds[name] == "" {
 					conds[name] = "service_healthy"
 				}
@@ -519,7 +558,7 @@ func selectRMIImages(cfg config.ComposeFile, mode string) []string {
 
 	for _, name := range names {
 		svc := cfg.Services[name]
-		if mode == "local" && svc.Image != "" && svc.Build.IsZero() {
+		if mode == "local" && (svc.Image != "" || svc.Build.IsZero()) {
 			continue
 		}
 		img := serviceImageTag(cfg, name, svc)
@@ -540,7 +579,7 @@ func resolveStopTimeout(explicit int, svc config.Service) int {
 	if secs, ok := config.ParseDurationSeconds(svc.StopGracePeriod); ok {
 		return secs
 	}
-	return -1
+	return 10
 }
 
 func validateServices(services map[string]config.Service) error {

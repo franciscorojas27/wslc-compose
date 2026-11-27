@@ -94,11 +94,10 @@ func RemoveVolume(ctx context.Context, name string, vol config.Volume) (string, 
 func ListVolumes(ctx context.Context) (map[string]bool, error) {
 	out, err := RunWSLC(ctx, "volume", "ls", "-q")
 	if err == nil {
-		firstLine := strings.ToUpper(strings.Split(out, "\n")[0])
-		isTable := strings.Contains(firstLine, "DRIVER") || strings.Contains(firstLine, "CONTROLADOR") || strings.Contains(firstLine, "VOLUME NAME") || strings.Contains(firstLine, "NOMBRE")
-		if !isTable {
+		lines := strings.Split(out, "\n")
+		if len(lines) == 0 || !isVolumeTableHeader(lines[0]) {
 			existing := make(map[string]bool)
-			for _, line := range strings.Split(out, "\n") {
+			for _, line := range lines {
 				name := strings.TrimSpace(line)
 				if name != "" {
 					existing[name] = true
@@ -117,23 +116,39 @@ func ListVolumes(ctx context.Context) (map[string]bool, error) {
 	return parseVolumeTable(out), nil
 }
 
+func isVolumeTableHeader(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	cols := multiSpaceRe.Split(trimmed, -1)
+	if len(cols) == 0 {
+		return false
+	}
+	for _, col := range cols {
+		switch strings.ToUpper(strings.TrimSpace(col)) {
+		case "DRIVER", "VOLUME NAME", "NAME", "CONTROLADOR", "NOMBRE DE VOLUMEN", "NOMBRE DEL VOLUMEN", "NOMBRE":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func parseVolumeTable(raw string) map[string]bool {
 	existing := make(map[string]bool)
 	lines := strings.Split(raw, "\n")
 	startIdx := 0
 	nameCol := -1
 
-	if len(lines) > 0 {
-		upperHeader := strings.ToUpper(lines[0])
-		if strings.Contains(upperHeader, "NAME") || strings.Contains(upperHeader, "DRIVER") || strings.Contains(upperHeader, "NOMBRE") || strings.Contains(upperHeader, "CONTROLADOR") {
-			startIdx = 1
-			headers := multiSpaceRe.Split(strings.TrimSpace(lines[0]), -1)
-			for i, h := range headers {
-				uh := strings.ToUpper(strings.TrimSpace(h))
-				if uh == "VOLUME NAME" || uh == "NAME" || uh == "NOMBRE DE VOLUMEN" || uh == "NOMBRE DEL VOLUMEN" || uh == "NOMBRE" {
-					nameCol = i
-					break
-				}
+	if len(lines) > 0 && isVolumeTableHeader(lines[0]) {
+		startIdx = 1
+		headers := multiSpaceRe.Split(strings.TrimSpace(lines[0]), -1)
+		for i, h := range headers {
+			uh := strings.ToUpper(strings.TrimSpace(h))
+			if uh == "VOLUME NAME" || uh == "NAME" || uh == "NOMBRE DE VOLUMEN" || uh == "NOMBRE DEL VOLUMEN" || uh == "NOMBRE" {
+				nameCol = i
+				break
 			}
 		}
 	}

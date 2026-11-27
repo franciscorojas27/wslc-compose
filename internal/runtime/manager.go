@@ -32,6 +32,7 @@ type DownOptions struct {
 	RemoveVolumes bool
 	RemoveOrphans bool
 	Timeout       int
+	HasTimeout    bool
 	RMI           string
 }
 
@@ -106,13 +107,14 @@ func Up(ctx context.Context, cfg config.ComposeFile, opts ...UpOptions) error {
 		return err
 	}
 
+	effectiveCfg := withDefaultNetwork(cfg, selectedServices)
 	waitConditions := computeWaitConditions(selectedServices, opt.Wait)
-	networkNames := managedNetworkNames(cfg.Networks)
-	volumeNames := managedVolumeNames(cfg.Volumes)
+	networkNames := managedNetworkNames(effectiveCfg.Networks)
+	volumeNames := managedVolumeNames(effectiveCfg.Volumes)
 
 	var orphans []ContainerInfo
 	if opt.RemoveOrphans {
-		orphans = findOrphanContainers(ctx, cfg)
+		orphans = findOrphanContainers(ctx, effectiveCfg)
 	}
 
 	ui := newProgressUI("Running")
@@ -120,34 +122,49 @@ func Up(ctx context.Context, cfg config.ComposeFile, opts ...UpOptions) error {
 		ui.add("orphan:"+orphan.Name, "Container", orphan.Name)
 	}
 	for _, key := range networkNames {
-		ui.add("net:"+key, "Network", cfg.NetworkName(key))
+		ui.add("net:"+key, "Network", effectiveCfg.NetworkName(key))
 	}
 	for _, key := range volumeNames {
-		ui.add("vol:"+key, "Volume", cfg.VolumeName(key))
+		ui.add("vol:"+key, "Volume", effectiveCfg.VolumeName(key))
 	}
 	for _, floor := range floors {
 		for _, svcName := range floor {
-			ui.add("svc:"+svcName, "Container", cfg.ContainerName(svcName))
+			ui.add("svc:"+svcName, "Container", effectiveCfg.ContainerName(svcName))
 		}
 	}
 	ui.start()
 
 	if len(orphans) > 0 {
-		removeOrphanContainers(ctx, orphans, ui, nil)
+		var (
+			orphanMu   sync.Mutex
+			orphanErrs []error
+		)
+		removeOrphanContainers(ctx, orphans, ui, func(err error) {
+			if err == nil {
+				return
+			}
+			orphanMu.Lock()
+			orphanErrs = append(orphanErrs, err)
+			orphanMu.Unlock()
+		})
+		if err := errors.Join(orphanErrs...); err != nil {
+			ui.finish()
+			return err
+		}
 	}
 
 	state := newRollbackState()
 	puller := newImagePuller()
 
-	if err := createManagedNetworks(ctx, cfg, networkNames, ui, state); err != nil {
+	if err := createManagedNetworks(ctx, effectiveCfg, networkNames, ui, state); err != nil {
 		ui.finish()
-		rollback(cfg, floors, state)
+		rollback(effectiveCfg, floors, state)
 		return err
 	}
 
-	if err := createManagedVolumes(ctx, cfg, volumeNames, ui, state); err != nil {
+	if err := createManagedVolumes(ctx, effectiveCfg, volumeNames, ui, state); err != nil {
 		ui.finish()
-		rollback(cfg, floors, state)
+		rollback(effectiveCfg, floors, state)
 		return err
 	}
 
@@ -158,12 +175,12 @@ func Up(ctx context.Context, cfg config.ComposeFile, opts ...UpOptions) error {
 			svc := selectedServices[name]
 			cond := waitConditions[name]
 			g.Go(func() error {
-				return startFloorService(gctx, cfg, name, svc, opt, cond, ui, state, puller)
+				return startFloorService(gctx, effectiveCfg, name, svc, opt, cond, ui, state, puller)
 			})
 		}
 		if err := g.Wait(); err != nil {
 			ui.finish()
-			rollback(cfg, floors, state)
+			rollback(effectiveCfg, floors, state)
 			return err
 		}
 	}
@@ -171,7 +188,7 @@ func Up(ctx context.Context, cfg config.ComposeFile, opts ...UpOptions) error {
 	ui.finish()
 
 	if !opt.Detach {
-		return attachAndWaitForeground(ctx, cfg, selectedNames, floors)
+		return attachAndWaitForeground(ctx, effectiveCfg, selectedNames, floors)
 	}
 
 	return nil
@@ -185,24 +202,32 @@ func attachAndWaitForeground(ctx context.Context, cfg config.ComposeFile, servic
 	sigCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
+	var logsErr error
 	out := stdout()
 	if sigCtx.Err() == nil {
 		fmt.Fprintf(out, "Attaching to %s\n", strings.Join(services, ", "))
-		_ = Logs(sigCtx, cfg, services, LogsOptions{Follow: true})
+		logsErr = Logs(sigCtx, cfg, services, LogsOptions{Follow: true})
 	}
 
 	interrupted := sigCtx.Err() != nil
 	stopSignals()
 
 	if !interrupted {
-		return nil
+		return logsErr
 	}
 
 	fmt.Fprintln(out, "Gracefully stopping...")
 	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	return stopFloors(stopCtx, cfg, floors, -1)
+	stopErr := stopFloors(stopCtx, cfg, floors, -1)
+	if stopErr != nil {
+		return stopErr
+	}
+	if logsErr != nil && !errors.Is(logsErr, context.Canceled) {
+		return logsErr
+	}
+	return nil
 }
 
 func stopFloors(ctx context.Context, cfg config.ComposeFile, floors [][]string, timeout int) error {
@@ -257,6 +282,9 @@ func Down(ctx context.Context, cfg config.ComposeFile, opts ...DownOptions) erro
 	opt := DownOptions{Timeout: -1}
 	if len(opts) > 0 {
 		opt = opts[0]
+		if opt.Timeout == 0 && !opt.HasTimeout {
+			opt.Timeout = -1
+		}
 	}
 
 	if opt.RMI != "" && opt.RMI != "all" && opt.RMI != "local" {
@@ -268,32 +296,34 @@ func Down(ctx context.Context, cfg config.ComposeFile, opts ...DownOptions) erro
 		return err
 	}
 
+	effectiveCfg := withDefaultNetwork(cfg, cfg.Services)
+
 	var orphans []ContainerInfo
 	if opt.RemoveOrphans {
-		orphans = findOrphanContainers(ctx, cfg)
+		orphans = findOrphanContainers(ctx, effectiveCfg)
 	}
 
 	var volumeNames []string
 	if opt.RemoveVolumes {
-		volumeNames = managedVolumeNames(cfg.Volumes)
+		volumeNames = managedVolumeNames(effectiveCfg.Volumes)
 	}
-	networkNames := managedNetworkNames(cfg.Networks)
-	imagesToRemove := selectRMIImages(cfg, opt.RMI)
+	networkNames := managedNetworkNames(effectiveCfg.Networks)
+	imagesToRemove := selectRMIImages(effectiveCfg, opt.RMI)
 
 	ui := newProgressUI("Stopping")
 	for i := len(floors) - 1; i >= 0; i-- {
 		for _, svcName := range floors[i] {
-			ui.add("svc:"+svcName, "Container", cfg.ContainerName(svcName))
+			ui.add("svc:"+svcName, "Container", effectiveCfg.ContainerName(svcName))
 		}
 	}
 	for _, orphan := range orphans {
 		ui.add("orphan:"+orphan.Name, "Container", orphan.Name)
 	}
 	for _, key := range volumeNames {
-		ui.add("vol:"+key, "Volume", cfg.VolumeName(key))
+		ui.add("vol:"+key, "Volume", effectiveCfg.VolumeName(key))
 	}
 	for _, key := range networkNames {
-		ui.add("net:"+key, "Network", cfg.NetworkName(key))
+		ui.add("net:"+key, "Network", effectiveCfg.NetworkName(key))
 	}
 	for _, img := range imagesToRemove {
 		ui.add("img:"+img, "Image", img)
@@ -313,18 +343,19 @@ func Down(ctx context.Context, cfg config.ComposeFile, opts ...DownOptions) erro
 		mu.Unlock()
 	}
 
+	skipGracefulStop := opt.HasTimeout && opt.Timeout == 0
 	for i := len(floors) - 1; i >= 0; i-- {
 		var wg sync.WaitGroup
 		for _, svcName := range floors[i] {
 			name := svcName
-			containerName := cfg.ContainerName(name)
-			svcTimeout := resolveStopTimeout(opt.Timeout, cfg.Services[name])
+			containerName := effectiveCfg.ContainerName(name)
+			svcTimeout := resolveStopTimeout(opt.Timeout, effectiveCfg.Services[name])
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				id := "svc:" + name
 				ui.setRunning(id, "Stopping")
-				if svcTimeout >= 0 {
+				if !skipGracefulStop {
 					if err := StopContainer(ctx, containerName, svcTimeout); err != nil {
 						ui.setFailed(id, "Error")
 						recordErr(err)
@@ -350,8 +381,8 @@ func Down(ctx context.Context, cfg config.ComposeFile, opts ...DownOptions) erro
 		var volWG sync.WaitGroup
 		for _, key := range volumeNames {
 			volKey := key
-			vol := cfg.Volumes[volKey]
-			realName := cfg.VolumeName(volKey)
+			vol := effectiveCfg.Volumes[volKey]
+			realName := effectiveCfg.VolumeName(volKey)
 			volWG.Add(1)
 			go func() {
 				defer volWG.Done()
@@ -371,8 +402,8 @@ func Down(ctx context.Context, cfg config.ComposeFile, opts ...DownOptions) erro
 	var netWG sync.WaitGroup
 	for _, key := range networkNames {
 		netKey := key
-		net := cfg.Networks[netKey]
-		realName := cfg.NetworkName(netKey)
+		net := effectiveCfg.Networks[netKey]
+		realName := effectiveCfg.NetworkName(netKey)
 		netWG.Add(1)
 		go func() {
 			defer netWG.Done()
@@ -423,6 +454,14 @@ func Start(ctx context.Context, cfg config.ComposeFile, targetServices []string)
 		return err
 	}
 
+	selectedServices := make(map[string]config.Service)
+	for _, floor := range filtered {
+		for _, name := range floor {
+			selectedServices[name] = cfg.Services[name]
+		}
+	}
+	waitConditions := computeWaitConditions(selectedServices, false)
+
 	ui := newProgressUI("Starting")
 	for _, floor := range filtered {
 		for _, name := range floor {
@@ -436,12 +475,21 @@ func Start(ctx context.Context, cfg config.ComposeFile, targetServices []string)
 		for _, svcName := range floor {
 			name := svcName
 			containerName := cfg.ContainerName(name)
+			svc := cfg.Services[name]
+			cond := waitConditions[name]
 			g.Go(func() error {
 				id := "svc:" + name
 				ui.setRunning(id, "Starting")
 				if err := StartExistingContainer(gctx, containerName); err != nil {
 					ui.setFailed(id, "Error")
 					return err
+				}
+				if cond != "" && cond != "service_started" {
+					ui.setRunning(id, "Waiting")
+					if err := WaitForCondition(gctx, containerName, svc, cond); err != nil {
+						ui.setFailed(id, "Unhealthy")
+						return err
+					}
 				}
 				ui.setDone(id, "Started")
 				return nil
@@ -492,6 +540,14 @@ func Restart(ctx context.Context, cfg config.ComposeFile, targetServices []strin
 		return err
 	}
 
+	selectedServices := make(map[string]config.Service)
+	for _, floor := range filtered {
+		for _, name := range floor {
+			selectedServices[name] = cfg.Services[name]
+		}
+	}
+	waitConditions := computeWaitConditions(selectedServices, false)
+
 	ui := newProgressUI("Restarting")
 	for _, floor := range filtered {
 		for _, name := range floor {
@@ -527,12 +583,21 @@ func Restart(ctx context.Context, cfg config.ComposeFile, targetServices []strin
 		for _, svcName := range floor {
 			name := svcName
 			containerName := cfg.ContainerName(name)
+			svc := cfg.Services[name]
+			cond := waitConditions[name]
 			g.Go(func() error {
 				id := "svc:" + name
 				ui.setRunning(id, "Restarting")
 				if err := StartExistingContainer(gctx, containerName); err != nil {
 					ui.setFailed(id, "Error")
 					return err
+				}
+				if cond != "" && cond != "service_started" {
+					ui.setRunning(id, "Waiting")
+					if err := WaitForCondition(gctx, containerName, svc, cond); err != nil {
+						ui.setFailed(id, "Unhealthy")
+						return err
+					}
 				}
 				ui.setDone(id, "Restarted")
 				return nil

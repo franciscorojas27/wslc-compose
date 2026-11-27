@@ -55,8 +55,8 @@ func CP(ctx context.Context, cfg config.ComposeFile, src string, dst string, opt
 		opt = opts[0]
 	}
 
-	srcSvc, srcPath, srcIsSvc := parseCPTarget(src)
-	dstSvc, dstPath, dstIsSvc := parseCPTarget(dst)
+	srcSvc, srcPath, srcIsSvc := parseCPTargetForServices(src, cfg.Services)
+	dstSvc, dstPath, dstIsSvc := parseCPTargetForServices(dst, cfg.Services)
 
 	if !srcIsSvc && !dstIsSvc {
 		return fmt.Errorf("either source or destination must specify a service in SERVICE:PATH format")
@@ -98,6 +98,20 @@ func CP(ctx context.Context, cfg config.ComposeFile, src string, dst string, opt
 		return fmt.Errorf("failed to copy %q to %q: %w", src, dst, err)
 	}
 	return nil
+}
+
+func parseCPTargetForServices(arg string, services map[string]config.Service) (string, string, bool) {
+	if arg == "" || arg == "-" {
+		return "", "", false
+	}
+	svc, remotePath, ok := strings.Cut(arg, ":")
+	if !ok || svc == "" || remotePath == "" || strings.ContainsAny(svc, "/\\") {
+		return "", "", false
+	}
+	if _, exists := services[svc]; exists && !(len(arg) >= 3 && arg[1] == ':' && arg[2] == '\\') {
+		return svc, remotePath, true
+	}
+	return parseCPTarget(arg)
 }
 
 func parseCPTarget(arg string) (string, string, bool) {

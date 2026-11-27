@@ -692,3 +692,94 @@ func TestEventsCommandFiltersProjectContainersAndJSON(t *testing.T) {
 		}
 	})
 }
+
+func TestBindMountValidationSkipsPOSIXPathsOnWindowsAndDownTimeoutBehavior(t *testing.T) {
+	t.Run("POSIX bind mount passes validation", func(t *testing.T) {
+		cfg := config.ComposeFile{
+			Name:    "demo",
+			BaseDir: t.TempDir(),
+			Services: map[string]config.Service{
+				"agent": {
+					Image: "alpine:latest",
+					Volumes: config.VolumeMounts{
+						{Type: "bind", Source: "/var/run/docker.sock", Target: "/var/run/docker.sock"},
+					},
+				},
+			},
+		}
+		if os.PathSeparator == '\\' {
+			if err := validateServiceBindMounts(cfg, "agent", cfg.Services["agent"]); err != nil {
+				t.Fatalf("POSIX path bind mount should skip Windows host os.Stat: %v", err)
+			}
+		}
+	})
+
+	t.Run("Down defaults to 10s stop timeout and skips stop on explicit timeout 0", func(t *testing.T) {
+		var (
+			mu    sync.Mutex
+			calls [][]string
+		)
+		withMockRuntime(
+			t,
+			func(ctx context.Context, args ...string) (string, error) {
+				mu.Lock()
+				calls = append(calls, append([]string(nil), args...))
+				mu.Unlock()
+				return "", nil
+			},
+			func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+				return "", nil
+			},
+		)
+
+		cfg := config.ComposeFile{
+			Name: "demo",
+			Services: map[string]config.Service{
+				"db": {Image: "postgres:16-alpine"},
+			},
+		}
+
+		if err := Down(context.Background(), cfg, DownOptions{RemoveVolumes: true}); err != nil {
+			t.Fatalf("Down failed: %v", err)
+		}
+		if len(calls) < 2 || !reflect.DeepEqual(calls[0], []string{"stop", "-t", "10", "demo-db-1"}) {
+			t.Fatalf("expected default 10s graceful stop, got calls: %v", calls)
+		}
+
+		calls = nil
+		if err := Down(context.Background(), cfg, DownOptions{Timeout: 0, HasTimeout: true}); err != nil {
+			t.Fatalf("Down with explicit timeout 0 failed: %v", err)
+		}
+		if len(calls) == 0 || calls[0][0] != "remove" {
+			t.Fatalf("expected explicit --timeout 0 to skip stop and remove immediately, got calls: %v", calls)
+		}
+	})
+
+	t.Run("Port auto-resolves UDP-only binding when protocol omitted", func(t *testing.T) {
+		inspectJSON := `[{"NetworkSettings":{"Ports":{"53/udp":[{"HostIp":"0.0.0.0","HostPort":"5353"}]}}}]`
+		outBuf := withMockRuntime(
+			t,
+			func(ctx context.Context, args ...string) (string, error) {
+				if len(args) >= 2 && args[0] == "inspect" {
+					return inspectJSON, nil
+				}
+				return "", ErrNotFound
+			},
+			func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+				return "", nil
+			},
+		)
+		cfg := config.ComposeFile{
+			Name: "demo",
+			Services: map[string]config.Service{
+				"dns": {Image: "coredns/coredns"},
+			},
+		}
+		if err := Port(context.Background(), cfg, "dns", "53"); err != nil {
+			t.Fatalf("Port failed for UDP-only binding: %v", err)
+		}
+		if strings.TrimSpace(outBuf.String()) != "0.0.0.0:5353" {
+			t.Fatalf("got %q, want 0.0.0.0:5353", strings.TrimSpace(outBuf.String()))
+		}
+	})
+}

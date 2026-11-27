@@ -26,6 +26,7 @@ var downCmd = &cobra.Command{
 			RemoveVolumes: downVolumes,
 			RemoveOrphans: downRemoveOrphans,
 			Timeout:       downTimeout,
+			HasTimeout:    cmd.Flags().Changed("timeout"),
 			RMI:           downRMI,
 		})
 	},

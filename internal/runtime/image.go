@@ -609,6 +609,16 @@ func imageInList(raw string, image string) bool {
 }
 
 func splitImageRef(ref string) (string, string) {
+	if atIdx := strings.Index(ref, "@"); atIdx >= 0 {
+		namePart := ref[:atIdx]
+		digest := ref[atIdx+1:]
+		lastSlash := strings.LastIndex(namePart, "/")
+		lastColon := strings.LastIndex(namePart, ":")
+		if lastColon > lastSlash {
+			return namePart[:lastColon], namePart[lastColon+1:] + "@" + digest
+		}
+		return namePart, digest
+	}
 	lastSlash := strings.LastIndex(ref, "/")
 	lastColon := strings.LastIndex(ref, ":")
 	if lastColon > lastSlash {
@@ -618,7 +628,17 @@ func splitImageRef(ref string) (string, string) {
 }
 
 func trimRegistryPrefix(repo string) string {
-	repo = strings.TrimPrefix(repo, "docker.io/library/")
-	repo = strings.TrimPrefix(repo, "docker.io/")
+	for _, prefix := range []string{"docker.io/", "index.docker.io/", "registry-1.docker.io/"} {
+		if strings.HasPrefix(repo, prefix) {
+			rest := strings.TrimPrefix(repo, prefix)
+			if !strings.Contains(rest, "/") {
+				return "library/" + rest
+			}
+			return rest
+		}
+	}
+	if !strings.Contains(repo, "/") && repo != "" {
+		return "library/" + repo
+	}
 	return repo
 }
