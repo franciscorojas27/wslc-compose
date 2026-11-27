@@ -50,16 +50,30 @@ func shouldSkipWSLCLookup(cmd *cobra.Command) bool {
 	return false
 }
 
-func Execute() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+func runWithSignals(fn func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	done := make(chan struct{})
+	defer close(done)
 
 	go func() {
-		<-ctx.Done()
-		stop()
+		select {
+		case <-sigCh:
+			cancel()
+		case <-done:
+		}
 	}()
 
-	if err := rootCmd.ExecuteContext(ctx); err != nil {
+	return fn(ctx)
+}
+
+func Execute() {
+	if err := runWithSignals(rootCmd.ExecuteContext); err != nil {
 		if errors.Is(err, context.Canceled) {
 			os.Exit(130)
 		}

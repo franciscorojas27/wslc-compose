@@ -482,9 +482,12 @@ func TestStatsCommandNoStreamAndLive(t *testing.T) {
 
 	t.Run("live mode clears screen and polls until canceled", func(t *testing.T) {
 		origInterval := statsPollInterval
+		origTTY := isStdoutTTYFunc
 		statsPollInterval = 10 * time.Millisecond
+		isStdoutTTYFunc = func() bool { return true }
 		t.Cleanup(func() {
 			statsPollInterval = origInterval
+			isStdoutTTYFunc = origTTY
 		})
 
 		var (
@@ -542,6 +545,77 @@ func TestStatsCommandNoStreamAndLive(t *testing.T) {
 
 		if strings.Count(outBuf.String(), "\033[H\033[2J") < 2 {
 			t.Fatalf("expected live stats to emit in-place ANSI clear before each snapshot, got:\n%q", outBuf.String())
+		}
+	})
+
+	t.Run("live mode omits ANSI clear when stdout is not a TTY", func(t *testing.T) {
+		origInterval := statsPollInterval
+		origTTY := isStdoutTTYFunc
+		statsPollInterval = 10 * time.Millisecond
+		isStdoutTTYFunc = func() bool { return false }
+		t.Cleanup(func() {
+			statsPollInterval = origInterval
+			isStdoutTTYFunc = origTTY
+		})
+
+		var (
+			mu    sync.Mutex
+			polls int
+		)
+		secondPoll := make(chan struct{})
+
+		outBuf := withMockRuntime(
+			t,
+			func(ctx context.Context, args ...string) (string, error) {
+				if len(args) > 0 && args[0] == "ps" {
+					return "id1\tdemo-web-1\tnginx:alpine\tUp 10s\t\t", nil
+				}
+				if len(args) > 0 && args[0] == "stats" {
+					mu.Lock()
+					polls++
+					p := polls
+					mu.Unlock()
+					if p == 2 {
+						close(secondPoll)
+					}
+					return "demo-web-1 1.0%", nil
+				}
+				return "", nil
+			},
+			func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+				return "", nil
+			},
+		)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- Stats(ctx, cfg, []string{"web"}, StatsOptions{NoStream: false})
+		}()
+
+		select {
+		case <-secondPoll:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for non-TTY live stats polling")
+		}
+		cancel()
+
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("Stats non-TTY live returned unexpected error: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for Stats non-TTY live to exit")
+		}
+
+		if strings.Contains(outBuf.String(), "\033[H\033[2J") {
+			t.Fatalf("did not expect ANSI clear codes when stdout is not a TTY, got:\n%q", outBuf.String())
+		}
+		if strings.Count(outBuf.String(), "demo-web-1 1.0%") < 2 {
+			t.Fatalf("expected stats snapshots to still be written without TTY, got:\n%q", outBuf.String())
 		}
 	})
 }
@@ -782,4 +856,138 @@ func TestBindMountValidationSkipsPOSIXPathsOnWindowsAndDownTimeoutBehavior(t *te
 			t.Fatalf("got %q, want 0.0.0.0:5353", strings.TrimSpace(outBuf.String()))
 		}
 	})
+}
+
+func TestCPSingleLetterServiceAndWindowsDrivePaths(t *testing.T) {
+	cfg := config.ComposeFile{
+		Name: "demo",
+		Services: map[string]config.Service{
+			"a": {Image: "alpine:latest"},
+		},
+	}
+
+	if !isWindowsDrivePath(`C:\temp\file.txt`) || !isWindowsDrivePath(`C:/temp/file.txt`) || !isWindowsDrivePath(`C:`) {
+		t.Fatalf("expected standard Windows drive paths to be detected")
+	}
+	if isWindowsDrivePath("a:file.txt") {
+		t.Fatalf("a:file.txt must not be treated as a Windows drive path")
+	}
+
+	t.Run("a:/etc/hosts resolves to container while C:\\temp\\file.txt stays host path", func(t *testing.T) {
+		var gotArgs []string
+		withMockRuntime(
+			t,
+			func(ctx context.Context, args ...string) (string, error) {
+				gotArgs = append([]string(nil), args...)
+				return "", nil
+			},
+			func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+				return "", nil
+			},
+		)
+
+		if err := CP(context.Background(), cfg, "a:/etc/hosts", `C:\temp\file.txt`); err != nil {
+			t.Fatalf("CP failed for a:/etc/hosts: %v", err)
+		}
+		want := []string{"cp", "demo-a-1:/etc/hosts", `C:\temp\file.txt`}
+		if !reflect.DeepEqual(gotArgs, want) {
+			t.Fatalf("got cp args %v, want %v", gotArgs, want)
+		}
+	})
+
+	t.Run("a:file.txt resolves to container path", func(t *testing.T) {
+		var gotArgs []string
+		withMockRuntime(
+			t,
+			func(ctx context.Context, args ...string) (string, error) {
+				gotArgs = append([]string(nil), args...)
+				return "", nil
+			},
+			func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+				return "", nil
+			},
+		)
+
+		if err := CP(context.Background(), cfg, "a:file.txt", `C:\temp\file.txt`); err != nil {
+			t.Fatalf("CP failed for a:file.txt: %v", err)
+		}
+		want := []string{"cp", "demo-a-1:file.txt", `C:\temp\file.txt`}
+		if !reflect.DeepEqual(gotArgs, want) {
+			t.Fatalf("got cp args %v, want %v", gotArgs, want)
+		}
+	})
+
+	if extracted := ExtractCPServices("a:/etc/hosts", `C:\temp\file.txt`); !reflect.DeepEqual(extracted, []string{"a"}) {
+		t.Fatalf("ExtractCPServices returned %v, want [a]", extracted)
+	}
+}
+
+func TestEventsDynamicIDRefreshOnContainerRecreate(t *testing.T) {
+	cfg := config.ComposeFile{
+		Name: "demo",
+		Services: map[string]config.Service{
+			"db": {Image: "postgres:16-alpine"},
+		},
+	}
+
+	var (
+		mu        sync.Mutex
+		recreated bool
+	)
+	doneEmitting := make(chan struct{})
+
+	outBuf := withMockRuntime(
+		t,
+		func(ctx context.Context, args ...string) (string, error) {
+			if len(args) > 0 && args[0] == "ps" {
+				mu.Lock()
+				isRecreated := recreated
+				mu.Unlock()
+				if isRecreated {
+					return "222222222222bbbb\tdemo-db-1\tpostgres:16-alpine\tUp 1s\t\t", nil
+				}
+				return "111111111111aaaa\tdemo-db-1\tpostgres:16-alpine\tUp 5s\t\t", nil
+			}
+			return "", nil
+		},
+		func(ctx context.Context, onLine func(string), args ...string) (string, error) {
+			onLine("2026-11-26T20:00:01Z container die 111111111111")
+			mu.Lock()
+			recreated = true
+			mu.Unlock()
+			onLine("2026-11-26T20:00:02Z container start 222222222222")
+			close(doneEmitting)
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Events(ctx, cfg, nil)
+	}()
+
+	select {
+	case <-doneEmitting:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for recreated container event")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Events returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for Events to exit")
+	}
+
+	output := outBuf.String()
+	if !strings.Contains(output, "111111111111") || !strings.Contains(output, "222222222222") {
+		t.Fatalf("expected events for both original and recreated container IDs, got:\n%s", output)
+	}
 }

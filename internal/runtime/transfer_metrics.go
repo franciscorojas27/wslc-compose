@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,17 +37,33 @@ type EventsOptions struct {
 	JSON bool
 }
 
-var statsPollInterval = time.Second
+var (
+	statsPollInterval = time.Second
+	eventHexIDRe      = regexp.MustCompile(`\b[0-9a-fA-F]{12,64}\b`)
+)
 
 func ExtractCPServices(src string, dst string) []string {
 	var services []string
-	if svc, _, ok := parseCPTarget(src); ok {
+	if svc, _, ok := parseCPCandidate(src); ok {
 		services = append(services, svc)
 	}
-	if svc, _, ok := parseCPTarget(dst); ok {
+	if svc, _, ok := parseCPCandidate(dst); ok {
 		services = append(services, svc)
 	}
 	return services
+}
+
+func parseCPCandidate(arg string) (string, string, bool) {
+	if svc, remotePath, ok := parseCPTarget(arg); ok {
+		return svc, remotePath, true
+	}
+	if len(arg) >= 3 && arg[1] == ':' && arg[2] == '/' {
+		ch := arg[0]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') {
+			return arg[:1], arg[2:], true
+		}
+	}
+	return "", "", false
 }
 
 func CP(ctx context.Context, cfg config.ComposeFile, src string, dst string, opts ...CPOptions) error {
@@ -416,6 +433,7 @@ func Stats(ctx context.Context, cfg config.ComposeFile, targetServices []string,
 	sigCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
+	tty := isStdoutTTY()
 	renderSnapshot := func() error {
 		res, runErr := RunWSLC(sigCtx, args...)
 		if runErr != nil {
@@ -424,10 +442,16 @@ func Stats(ctx context.Context, cfg config.ComposeFile, targetServices []string,
 			}
 			return fmt.Errorf("failed to retrieve container stats: %w", runErr)
 		}
+		if tty {
+			if res != "" {
+				fmt.Fprintf(out, "\033[H\033[2J%s\n", res)
+			} else {
+				fmt.Fprint(out, "\033[H\033[2J")
+			}
+			return nil
+		}
 		if res != "" {
-			fmt.Fprintf(out, "\033[H\033[2J%s\n", res)
-		} else {
-			fmt.Fprint(out, "\033[H\033[2J")
+			fmt.Fprintln(out, res)
 		}
 		return nil
 	}
@@ -490,8 +514,19 @@ func Events(ctx context.Context, cfg config.ComposeFile, targetServices []string
 		containerNames = append(containerNames, cName)
 	}
 
+	sigCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	var idMu sync.Mutex
 	idToContainer := make(map[string]string)
-	if containers, listErr := ListContainers(ctx); listErr == nil {
+	checkedHexIDs := make(map[string]bool)
+
+	refreshIDs := func(refreshCtx context.Context) {
+		containers, listErr := ListContainers(refreshCtx)
+		if listErr != nil {
+			return
+		}
+		idMu.Lock()
 		for _, c := range containers {
 			if _, ok := containerToService[c.Name]; !ok || c.ID == "" {
 				continue
@@ -501,14 +536,29 @@ func Events(ctx context.Context, cfg config.ComposeFile, targetServices []string
 				idToContainer[c.ID[:12]] = c.Name
 			}
 		}
+		idMu.Unlock()
 	}
 
-	sigCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
+	refreshIDs(sigCtx)
 
 	out := stdout()
 	_, runErr := RunWSLCStream(sigCtx, func(line string) {
+		idMu.Lock()
 		svc, container, matched := matchEventLine(line, containerNames, containerToService, idToContainer)
+		idMu.Unlock()
+
+		if !matched {
+			unknownIDs := findUncheckedHexIDs(line, &idMu, idToContainer, checkedHexIDs)
+			if len(unknownIDs) > 0 {
+				refreshIDs(sigCtx)
+				idMu.Lock()
+				for _, id := range unknownIDs {
+					checkedHexIDs[id] = true
+				}
+				svc, container, matched = matchEventLine(line, containerNames, containerToService, idToContainer)
+				idMu.Unlock()
+			}
+		}
 		if !matched {
 			return
 		}
@@ -526,6 +576,23 @@ func Events(ctx context.Context, cfg config.ComposeFile, targetServices []string
 		return fmt.Errorf("failed to stream container events: %w", runErr)
 	}
 	return nil
+}
+
+func findUncheckedHexIDs(line string, mu *sync.Mutex, known map[string]string, checked map[string]bool) []string {
+	matches := eventHexIDRe.FindAllString(line, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var unknown []string
+	for _, m := range matches {
+		if _, isKnown := known[m]; isKnown || checked[m] {
+			continue
+		}
+		unknown = append(unknown, m)
+	}
+	return unknown
 }
 
 func matchEventLine(line string, containerNames []string, containerToService map[string]string, idToContainer map[string]string) (string, string, bool) {

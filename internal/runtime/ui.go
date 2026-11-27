@@ -66,7 +66,10 @@ type progressUI struct {
 	once      sync.Once
 }
 
-var stdoutWriter io.Writer
+var (
+	stdoutWriter    io.Writer
+	isStdoutTTYFunc = detectStdoutTTY
+)
 
 func stdout() io.Writer {
 	if stdoutWriter != nil {
@@ -76,6 +79,10 @@ func stdout() io.Writer {
 }
 
 func isStdoutTTY() bool {
+	return isStdoutTTYFunc()
+}
+
+func detectStdoutTTY() bool {
 	if stdoutWriter != nil && stdoutWriter != os.Stdout {
 		return false
 	}

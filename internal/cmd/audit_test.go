@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"reflect"
 	"testing"
@@ -298,4 +299,21 @@ func TestAuditPersistentPreRunSkipsWSLCLookupForCompletionAndHelp(t *testing.T) 
 			t.Fatalf("expected ps to fail when wslc is missing from PATH")
 		}
 	})
+}
+
+func TestRunWithSignalsCancelsContextOnExit(t *testing.T) {
+	var captured context.Context
+	err := runWithSignals(func(ctx context.Context) error {
+		captured = ctx
+		if ctx.Err() != nil {
+			t.Fatalf("expected active context during execution, got %v", ctx.Err())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if captured == nil || captured.Err() == nil {
+		t.Fatalf("expected context to be canceled cleanly on exit")
+	}
 }
