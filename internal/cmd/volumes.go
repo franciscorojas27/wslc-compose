@@ -9,6 +9,7 @@ import (
 var volumesCmd = &cobra.Command{
 	Use:   "volumes",
 	Short: "List volumes declared in the Compose file",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadComposeAll()
 		if err != nil {

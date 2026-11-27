@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"os"
 	"wslc-compose/internal/runtime"
 
 	"github.com/spf13/cobra"
@@ -30,7 +29,7 @@ var rmCmd = &cobra.Command{
 }
 
 func init() {
-	rmCmd.Flags().StringVar(&composeFile, "file", os.Getenv("COMPOSE_FILE"), "Compose configuration file")
+	rmCmd.Flags().StringArrayVar(&composeFiles, "file", nil, "Compose configuration file")
 	_ = rmCmd.Flags().MarkHidden("file")
 	rmCmd.Flags().BoolVarP(&rmForce, "force", "f", false, "Do not ask to confirm removal")
 	rmCmd.Flags().BoolVarP(&rmStop, "stop", "s", false, "Stop the containers, if required, before removing")

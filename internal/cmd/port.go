@@ -21,9 +21,16 @@ var portCmd = &cobra.Command{
 			return err
 		}
 		return runtime.Port(cmd.Context(), cfg, service, privatePort, runtime.PortOptions{
-			Protocol: portProtocol,
+			Protocol: resolvePortProtocol(cmd),
 		})
 	},
+}
+
+func resolvePortProtocol(cmd *cobra.Command) string {
+	if cmd != nil && cmd.Flags().Changed("protocol") {
+		return portProtocol
+	}
+	return ""
 }
 
 func init() {

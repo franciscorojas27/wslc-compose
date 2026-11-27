@@ -17,6 +17,7 @@ var (
 var psCmd = &cobra.Command{
 	Use:   "ps",
 	Short: "List containers",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadComposeAll()
 		if err != nil {

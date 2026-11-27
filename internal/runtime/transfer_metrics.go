@@ -143,10 +143,7 @@ func Port(ctx context.Context, cfg config.ComposeFile, service string, privatePo
 			proto = strings.ToLower(strings.TrimSpace(embeddedProto))
 		}
 	}
-	if proto == "" {
-		proto = "tcp"
-	}
-	if proto != "tcp" && proto != "udp" {
+	if proto != "" && proto != "tcp" && proto != "udp" {
 		return fmt.Errorf("unsupported protocol %q: expected \"tcp\" or \"udp\"", proto)
 	}
 
@@ -156,13 +153,26 @@ func Port(ctx context.Context, cfg config.ComposeFile, service string, privatePo
 	}
 
 	containerName := cfg.ContainerName(service)
-	portKey := fmt.Sprintf("%d/%s", portNum, proto)
+	var candidateKeys []string
+	var portLabel string
+	if proto != "" {
+		portLabel = fmt.Sprintf("%d/%s", portNum, proto)
+		candidateKeys = []string{portLabel}
+	} else {
+		portLabel = fmt.Sprintf("%d", portNum)
+		candidateKeys = []string{
+			fmt.Sprintf("%d/tcp", portNum),
+			fmt.Sprintf("%d/udp", portNum),
+		}
+	}
 
 	inspectOut, inspectErr := RunWSLC(ctx, "inspect", containerName)
 	if inspectErr == nil {
-		if binding := extractPortFromInspectJSON(inspectOut, portKey); binding != "" {
-			fmt.Fprintln(stdout(), binding)
-			return nil
+		for _, portKey := range candidateKeys {
+			if binding := extractPortFromInspectJSON(inspectOut, portKey); binding != "" {
+				fmt.Fprintln(stdout(), binding)
+				return nil
+			}
 		}
 	}
 
@@ -170,9 +180,11 @@ func Port(ctx context.Context, cfg config.ComposeFile, service string, privatePo
 	if listErr == nil {
 		for _, c := range containers {
 			if c.Name == containerName {
-				if binding := extractPortFromPortsString(c.Ports, portKey); binding != "" {
-					fmt.Fprintln(stdout(), binding)
-					return nil
+				for _, portKey := range candidateKeys {
+					if binding := extractPortFromPortsString(c.Ports, portKey); binding != "" {
+						fmt.Fprintln(stdout(), binding)
+						return nil
+					}
 				}
 				break
 			}
@@ -183,7 +195,7 @@ func Port(ctx context.Context, cfg config.ComposeFile, service string, privatePo
 		return fmt.Errorf("container %q for service %q not found", containerName, service)
 	}
 
-	return fmt.Errorf("no public port %q published for service %q", portKey, service)
+	return fmt.Errorf("no public port %q published for service %q", portLabel, service)
 }
 
 type inspectPortBinding struct {

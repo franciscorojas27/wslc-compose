@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"wslc-compose/internal/config"
 
@@ -14,20 +15,20 @@ import (
 )
 
 var (
-	version     = "dev"
-	composeFile string
-	projectName string
-	envFile     string
-	profiles    []string
+	version      = "dev"
+	composeFiles []string
+	projectName  string
+	envFile      string
+	profiles     []string
 )
 
 var rootCmd = &cobra.Command{
-	Use:     "wslc-compose",
-	Short:   "Container orchestrator for Windows using wslc.exe",
-	Version: version,
+	Use:              "wslc-compose",
+	Short:            "Container orchestrator for Windows using wslc.exe",
+	Version:          version,
+	TraverseChildren: true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		switch cmd.Name() {
-		case "config", "help", "completion", "__complete":
+		if shouldSkipWSLCLookup(cmd) {
 			return nil
 		}
 		if _, err := exec.LookPath("wslc"); err != nil {
@@ -37,6 +38,16 @@ var rootCmd = &cobra.Command{
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
+}
+
+func shouldSkipWSLCLookup(cmd *cobra.Command) bool {
+	for cur := cmd; cur != nil; cur = cur.Parent() {
+		switch cur.Name() {
+		case "config", "help", "version", "completion", "__complete", "__completeNoDesc":
+			return true
+		}
+	}
+	return false
 }
 
 func Execute() {
@@ -57,19 +68,74 @@ func Execute() {
 	}
 }
 
-func activeProfiles() []string {
-	var list []string
-	if envProfiles := os.Getenv("COMPOSE_PROFILES"); envProfiles != "" {
-		list = append(list, envProfiles)
+func resolvedComposeFiles() []string {
+	if len(composeFiles) > 0 {
+		out := make([]string, 0, len(composeFiles))
+		for _, f := range composeFiles {
+			trimmed := strings.TrimSpace(f)
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
 	}
-	list = append(list, profiles...)
-	return list
+	envFiles := os.Getenv("COMPOSE_FILE")
+	if envFiles == "" {
+		return nil
+	}
+	parts := strings.Split(envFiles, string(os.PathListSeparator))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func resolvedProjectName() string {
+	if projectName != "" {
+		return projectName
+	}
+	return os.Getenv("COMPOSE_PROJECT_NAME")
+}
+
+func activeProfiles() []string {
+	if len(profiles) > 0 {
+		out := make([]string, 0, len(profiles))
+		for _, p := range profiles {
+			trimmed := strings.TrimSpace(p)
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	envProfiles := os.Getenv("COMPOSE_PROFILES")
+	if envProfiles == "" {
+		return nil
+	}
+	parts := strings.Split(envProfiles, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func loadCompose(explicitServices []string) (config.ComposeFile, error) {
 	active := activeProfiles()
-	cfg, err := config.Load(composeFile, config.LoadOptions{
-		ProjectName: projectName,
+	cfg, err := config.Load("", config.LoadOptions{
+		Files:       resolvedComposeFiles(),
+		ProjectName: resolvedProjectName(),
 		EnvFile:     envFile,
 		Profiles:    active,
 	})
@@ -81,8 +147,9 @@ func loadCompose(explicitServices []string) (config.ComposeFile, error) {
 
 func loadComposeAll() (config.ComposeFile, error) {
 	active := activeProfiles()
-	cfg, err := config.Load(composeFile, config.LoadOptions{
-		ProjectName: projectName,
+	cfg, err := config.Load("", config.LoadOptions{
+		Files:       resolvedComposeFiles(),
+		ProjectName: resolvedProjectName(),
 		EnvFile:     envFile,
 		Profiles:    active,
 	})
@@ -96,10 +163,8 @@ func loadComposeAll() (config.ComposeFile, error) {
 }
 
 func init() {
-	defaultFile := os.Getenv("COMPOSE_FILE")
-	defaultProject := os.Getenv("COMPOSE_PROJECT_NAME")
-	rootCmd.PersistentFlags().StringVarP(&composeFile, "file", "f", defaultFile, "Compose configuration file path")
-	rootCmd.PersistentFlags().StringVarP(&projectName, "project-name", "p", defaultProject, "Project name")
+	rootCmd.PersistentFlags().StringArrayVarP(&composeFiles, "file", "f", nil, "Compose configuration file path")
+	rootCmd.PersistentFlags().StringVarP(&projectName, "project-name", "p", "", "Project name")
 	rootCmd.PersistentFlags().StringVar(&envFile, "env-file", "", "Specify an alternate environment file")
 	rootCmd.PersistentFlags().StringArrayVar(&profiles, "profile", nil, "Specify a profile to enable")
 }

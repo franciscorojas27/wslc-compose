@@ -16,6 +16,7 @@ var (
 var downCmd = &cobra.Command{
 	Use:   "down",
 	Short: "Stop and remove containers, networks",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadComposeAll()
 		if err != nil {

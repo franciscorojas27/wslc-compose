@@ -15,6 +15,7 @@ var (
 var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Parse, resolve and render Compose file in canonical format",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadCompose(nil)
 		if err != nil {

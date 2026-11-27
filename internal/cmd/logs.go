@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"os"
 	"wslc-compose/internal/runtime"
 
 	"github.com/spf13/cobra"
@@ -30,7 +29,7 @@ var logsCmd = &cobra.Command{
 }
 
 func init() {
-	logsCmd.Flags().StringVar(&composeFile, "file", os.Getenv("COMPOSE_FILE"), "Compose configuration file")
+	logsCmd.Flags().StringArrayVar(&composeFiles, "file", nil, "Compose configuration file")
 	_ = logsCmd.Flags().MarkHidden("file")
 	logsCmd.Flags().BoolVarP(&logsFollow, "follow", "f", false, "Follow log output")
 	logsCmd.Flags().StringVar(&logsTail, "tail", "all", "Number of lines to show from the end of the logs for each container")
