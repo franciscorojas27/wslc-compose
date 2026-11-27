@@ -56,13 +56,34 @@ func LoadEnvFile(path string, required bool) (map[string]string, error) {
 
 func parseEnvValue(raw string) string {
 	trimmed := strings.TrimSpace(raw)
-	if len(trimmed) >= 2 && trimmed[0] == '\'' && trimmed[len(trimmed)-1] == '\'' {
-		return trimmed[1 : len(trimmed)-1]
+	if trimmed == "" {
+		return ""
 	}
-	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
-		return unescapeDoubleQuoted(trimmed[1 : len(trimmed)-1])
+	if trimmed[0] == '\'' {
+		if end := strings.IndexByte(trimmed[1:], '\''); end >= 0 {
+			closeIdx := end + 1
+			rest := strings.TrimSpace(trimmed[closeIdx+1:])
+			if rest == "" || strings.HasPrefix(rest, "#") {
+				return trimmed[1:closeIdx]
+			}
+		}
 	}
-	if idx := strings.Index(trimmed, " #"); idx >= 0 {
+	if trimmed[0] == '"' {
+		for i := 1; i < len(trimmed); i++ {
+			if trimmed[i] == '\\' && i+1 < len(trimmed) {
+				i++
+				continue
+			}
+			if trimmed[i] == '"' {
+				rest := strings.TrimSpace(trimmed[i+1:])
+				if rest == "" || strings.HasPrefix(rest, "#") {
+					return unescapeDoubleQuoted(trimmed[1:i])
+				}
+				break
+			}
+		}
+	}
+	if idx := strings.IndexByte(trimmed, '#'); idx >= 0 {
 		trimmed = strings.TrimSpace(trimmed[:idx])
 	}
 	return trimmed

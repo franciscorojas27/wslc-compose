@@ -392,3 +392,109 @@ volumes:
 		t.Fatalf("expected long bind source %q, got %+v", wantDataSource, multi.Volumes)
 	}
 }
+
+func TestASTInterpolationTypedScalarsAndAnchors(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SVC_PRIV", "true")
+	t.Setenv("HC_RETRIES", "7")
+	t.Setenv("ZERO_CODE", "007")
+
+	composeYAML := `
+x-defaults: &defaults
+  environment:
+    SHARED_LITERAL: $$100
+    CODE: ${ZERO_CODE}
+services:
+  app:
+    <<: *defaults
+    image: alpine:latest
+    privileged: ${SVC_PRIV}
+    healthcheck:
+      test: ["CMD", "true"]
+      retries: ${HC_RETRIES}
+`
+	path := filepath.Join(dir, "compose.yaml")
+	if err := os.WriteFile(path, []byte(composeYAML), 0644); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	app := cfg.Services["app"]
+	if !app.Privileged {
+		t.Fatalf("expected privileged=true from interpolated bool")
+	}
+	if app.HealthCheck == nil || app.HealthCheck.Retries != 7 {
+		t.Fatalf("expected retries=7, got %+v", app.HealthCheck)
+	}
+	if app.Environment["SHARED_LITERAL"] != "$100" {
+		t.Fatalf("expected anchor escaped literal '$100', got %q", app.Environment["SHARED_LITERAL"])
+	}
+	if app.Environment["CODE"] != "007" {
+		t.Fatalf("expected leading-zero string '007', got %q", app.Environment["CODE"])
+	}
+}
+
+func TestComposeSpecBuildArgsPortsExtraHostsAndResolvePath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ARG_FROM_HOST", "secret_val")
+
+	composeYAML := `
+services:
+  web:
+    image: nginx:alpine
+    build:
+      context: ./app
+      args:
+        - EXPLICIT=yes
+        - ARG_FROM_HOST
+        - UNSET_ARG
+    ports:
+      - 3000
+      - "8080:80"
+      - target: 443
+        published: 8443
+        host_ip: "::1"
+        protocol: tcp
+        mode: ingress
+      - target: 9000
+    extra_hosts:
+      single.local: 10.0.0.1
+      multi.local:
+        - 10.0.0.2
+        - 10.0.0.3
+`
+	path := filepath.Join(dir, "compose.yaml")
+	if err := os.WriteFile(path, []byte(composeYAML), 0644); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	web := cfg.Services["web"]
+	wantArgs := map[string]string{
+		"EXPLICIT":      "yes",
+		"ARG_FROM_HOST": "secret_val",
+	}
+	if !reflect.DeepEqual(web.Build.Args, wantArgs) {
+		t.Fatalf("got build.args %#v, want %#v", web.Build.Args, wantArgs)
+	}
+	wantPorts := PortList{"3000", "8080:80", "[::1]:8443:443/tcp", "9000"}
+	if !reflect.DeepEqual(web.Ports, wantPorts) {
+		t.Fatalf("got ports %#v, want %#v", web.Ports, wantPorts)
+	}
+	wantHosts := ExtraHosts{"single.local:10.0.0.1", "multi.local:10.0.0.2", "multi.local:10.0.0.3"}
+	if !reflect.DeepEqual(web.ExtraHosts, wantHosts) {
+		t.Fatalf("got extra_hosts %#v, want %#v", web.ExtraHosts, wantHosts)
+	}
+	if got := cfg.ResolvePath("/var/run/docker.sock"); got != "/var/run/docker.sock" {
+		t.Fatalf("expected POSIX path preserved, got %q", got)
+	}
+	if got := cfg.ResolvePath("/mnt/c/foo/../bar"); got != "/mnt/c/bar" {
+		t.Fatalf("expected cleaned POSIX path, got %q", got)
+	}
+}
