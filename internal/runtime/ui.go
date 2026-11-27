@@ -393,7 +393,9 @@ func (u *progressUI) renderLocked() {
 
 func formatBrailleColumn(item *progressItem, frame int, width int) string {
 	var b strings.Builder
-	b.WriteString(ansiDim + "[" + ansiReset)
+	b.WriteString(ansiDim)
+	b.WriteByte('[')
+	b.WriteString(ansiReset)
 
 	if len(item.layers) > 0 {
 		for _, lvl := range item.layers {
@@ -403,15 +405,16 @@ func formatBrailleColumn(item *progressItem, frame int, width int) string {
 			if lvl >= len(brailleSteps) {
 				lvl = len(brailleSteps) - 1
 			}
-			glyph := brailleSteps[lvl]
+			color := ansiDim
 			switch {
 			case lvl == 8:
-				b.WriteString(ansiGreen + glyph + ansiReset)
+				color = ansiGreen
 			case lvl > 0:
-				b.WriteString(ansiCyan + glyph + ansiReset)
-			default:
-				b.WriteString(ansiDim + glyph + ansiReset)
+				color = ansiCyan
 			}
+			b.WriteString(color)
+			b.WriteString(brailleSteps[lvl])
+			b.WriteString(ansiReset)
 		}
 	} else {
 		const cells = 6
@@ -428,15 +431,19 @@ func formatBrailleColumn(item *progressItem, frame int, width int) string {
 			if cellVal > 8 {
 				cellVal = 8
 			}
+			color := ansiDim
 			if cellVal > 0 {
-				b.WriteString(ansiCyan + brailleSteps[cellVal] + ansiReset)
-			} else {
-				b.WriteString(ansiDim + brailleSteps[0] + ansiReset)
+				color = ansiCyan
 			}
+			b.WriteString(color)
+			b.WriteString(brailleSteps[cellVal])
+			b.WriteString(ansiReset)
 		}
 	}
 
-	b.WriteString(ansiDim + "]" + ansiReset)
+	b.WriteString(ansiDim)
+	b.WriteByte(']')
+	b.WriteString(ansiReset)
 	content := b.String()
 	if pad := width - visibleLen(content); pad > 0 {
 		content += strings.Repeat(" ", pad)
