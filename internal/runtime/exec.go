@@ -20,12 +20,19 @@ const (
 )
 
 var (
-	ErrAlreadyExists = errors.New("resource already exists")
-	ErrNotFound      = errors.New("resource not found")
-	ansiEscapeRe     = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+	ErrAlreadyExists        = errors.New("resource already exists")
+	ErrNotFound             = errors.New("resource not found")
+	ansiEscapeRe            = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+	execWSLCFunc            = runWSLC
+	execWSLCInteractiveFunc = runWSLCInteractive
+	execWSLCStreamFunc      = runWSLCStream
 )
 
 func RunWSLC(ctx context.Context, args ...string) (string, error) {
+	return execWSLCFunc(ctx, args...)
+}
+
+func runWSLC(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "wslc.exe", args...)
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
@@ -53,6 +60,10 @@ func RunWSLC(ctx context.Context, args ...string) (string, error) {
 }
 
 func RunWSLCInteractive(ctx context.Context, args ...string) error {
+	return execWSLCInteractiveFunc(ctx, args...)
+}
+
+func runWSLCInteractive(ctx context.Context, args ...string) error {
 	cmd := exec.CommandContext(ctx, "wslc.exe", args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -68,6 +79,10 @@ func RunWSLCInteractive(ctx context.Context, args ...string) error {
 }
 
 func RunWSLCStream(ctx context.Context, onLine func(string), args ...string) (string, error) {
+	return execWSLCStreamFunc(ctx, onLine, args...)
+}
+
+func runWSLCStream(ctx context.Context, onLine func(string), args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "wslc.exe", args...)
 
 	stdoutPipe, err := cmd.StdoutPipe()

@@ -66,7 +66,19 @@ type progressUI struct {
 	once      sync.Once
 }
 
+var stdoutWriter io.Writer
+
+func stdout() io.Writer {
+	if stdoutWriter != nil {
+		return stdoutWriter
+	}
+	return os.Stdout
+}
+
 func isStdoutTTY() bool {
+	if stdoutWriter != nil && stdoutWriter != os.Stdout {
+		return false
+	}
 	fi, err := os.Stdout.Stat()
 	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
 }
@@ -78,7 +90,7 @@ func isStdinTTY() bool {
 
 func newProgressUI(title string) *progressUI {
 	return &progressUI{
-		out:    os.Stdout,
+		out:    stdout(),
 		isTTY:  isStdoutTTY(),
 		title:  title,
 		index:  make(map[string]*progressItem),
@@ -430,17 +442,6 @@ func formatBrailleColumn(item *progressItem, frame int, width int) string {
 		content += strings.Repeat(" ", pad)
 	}
 	return content
-}
-
-func truncateRunes(s string, max int) string {
-	if utf8.RuneCountInString(s) <= max {
-		return s
-	}
-	runes := []rune(s)
-	if max <= 3 {
-		return string(runes[:max])
-	}
-	return string(runes[:max-3]) + "..."
 }
 
 func visibleLen(s string) int {

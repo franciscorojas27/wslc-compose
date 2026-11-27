@@ -3,8 +3,6 @@ package runtime
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,30 +22,6 @@ type PSOptions struct {
 	Services bool
 	Status   []string
 	Format   string
-}
-
-type LogsOptions struct {
-	Follow     bool
-	Tail       string
-	Timestamps bool
-}
-
-type ExecOptions struct {
-	NoTTY   bool
-	User    string
-	Workdir string
-	Env     []string
-}
-
-type RunOptions struct {
-	Remove        bool
-	Env           []string
-	Workdir       string
-	User          string
-	Entrypoint    string
-	HasEntrypoint bool
-	NoDeps        bool
-	Detach        bool
 }
 
 type ConfigOptions struct {
@@ -142,9 +116,11 @@ func PS(ctx context.Context, cfg config.ComposeFile, opts ...PSOptions) error {
 		})
 	}
 
+	out := stdout()
+
 	if opt.Services {
 		for _, item := range matched {
-			fmt.Fprintln(os.Stdout, item.service)
+			fmt.Fprintln(out, item.service)
 		}
 		return nil
 	}
@@ -152,9 +128,9 @@ func PS(ctx context.Context, cfg config.ComposeFile, opts ...PSOptions) error {
 	if opt.Quiet {
 		for _, item := range matched {
 			if item.container.Name != "" {
-				fmt.Fprintln(os.Stdout, item.container.Name)
+				fmt.Fprintln(out, item.container.Name)
 			} else if item.container.ID != "" {
-				fmt.Fprintln(os.Stdout, item.container.ID)
+				fmt.Fprintln(out, item.container.ID)
 			}
 		}
 		return nil
@@ -172,7 +148,7 @@ func PS(ctx context.Context, cfg config.ComposeFile, opts ...PSOptions) error {
 				Ports:   item.container.Ports,
 			})
 		}
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(entries)
 	}
@@ -196,13 +172,14 @@ func PS(ctx context.Context, cfg config.ComposeFile, opts ...PSOptions) error {
 		rows = append(rows, []string{item.container.Name, item.service, status, item.container.Ports})
 	}
 
-	printTable(os.Stdout, []string{"NAME", "SERVICE", "STATUS", "PORTS"}, rows)
+	printTable(out, []string{"NAME", "SERVICE", "STATUS", "PORTS"}, rows)
 	return nil
 }
 
 func Volumes(ctx context.Context, cfg config.ComposeFile) error {
+	out := stdout()
 	if len(cfg.Volumes) == 0 {
-		fmt.Fprintln(os.Stdout, "No volumes declared in compose file.")
+		fmt.Fprintln(out, "No volumes declared in compose file.")
 		return nil
 	}
 
@@ -219,9 +196,9 @@ func Volumes(ctx context.Context, cfg config.ComposeFile) error {
 	for _, key := range names {
 		vol := cfg.Volumes[key]
 		realName := cfg.VolumeName(key)
-		driver := vol.Driver
-		if driver == "" {
-			driver = "local"
+		driver := strings.TrimSpace(vol.Driver)
+		if driver == "" || strings.EqualFold(driver, "local") {
+			driver = "guest"
 		}
 
 		exists := false
@@ -250,232 +227,8 @@ func Volumes(ctx context.Context, cfg config.ComposeFile) error {
 		})
 	}
 
-	printTable(os.Stdout, []string{"VOLUME", "NAME", "DRIVER", "EXTERNAL", "EXISTS"}, rows)
+	printTable(out, []string{"VOLUME", "NAME", "DRIVER", "EXTERNAL", "EXISTS"}, rows)
 	return nil
-}
-
-func Logs(ctx context.Context, cfg config.ComposeFile, targetServices []string, opts ...LogsOptions) error {
-	var opt LogsOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-
-	names, err := selectServices(cfg.Services, targetServices)
-	if err != nil {
-		return err
-	}
-	if len(names) == 0 {
-		return nil
-	}
-
-	maxNameLen := 0
-	for _, name := range names {
-		if len(name) > maxNameLen {
-			maxNameLen = len(name)
-		}
-	}
-
-	tty := isStdoutTTY()
-	var (
-		printMu sync.Mutex
-		errMu   sync.Mutex
-		errs    []error
-		wg      sync.WaitGroup
-	)
-
-	for idx, svcName := range names {
-		name := svcName
-		containerName := cfg.ContainerName(name)
-		color := logColors[idx%len(logColors)]
-		padded := fmt.Sprintf("%-*s", maxNameLen, name)
-		prefix := padded + " | "
-		if tty {
-			prefix = color + padded + ansiReset + " " + ansiDim + "|" + ansiReset + " "
-		}
-
-		args := []string{"logs"}
-		if opt.Follow {
-			args = append(args, "-f")
-		}
-		if opt.Timestamps {
-			args = append(args, "-t")
-		}
-		if opt.Tail != "" && !strings.EqualFold(opt.Tail, "all") {
-			args = append(args, "--tail", opt.Tail)
-		}
-		args = append(args, containerName)
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, runErr := RunWSLCStream(ctx, func(line string) {
-				printMu.Lock()
-				fmt.Fprintf(os.Stdout, "%s%s\n", prefix, line)
-				printMu.Unlock()
-			}, args...)
-			if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, ErrNotFound) {
-				errMu.Lock()
-				errs = append(errs, fmt.Errorf("failed to read logs for service %q: %w", name, runErr))
-				errMu.Unlock()
-			}
-		}()
-	}
-
-	wg.Wait()
-	return errors.Join(errs...)
-}
-
-func Exec(ctx context.Context, cfg config.ComposeFile, service string, command []string, opts ...ExecOptions) error {
-	var opt ExecOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-
-	if _, ok := cfg.Services[service]; !ok {
-		return fmt.Errorf("service %q not found in compose file", service)
-	}
-	if len(command) == 0 {
-		return fmt.Errorf("command is required")
-	}
-
-	args := []string{"exec"}
-	if !opt.NoTTY && isStdinTTY() {
-		args = append(args, "-it")
-	} else {
-		args = append(args, "-i")
-	}
-	if opt.User != "" {
-		args = append(args, "-u", opt.User)
-	}
-	if opt.Workdir != "" {
-		args = append(args, "-w", opt.Workdir)
-	}
-	for _, env := range opt.Env {
-		if env != "" {
-			args = append(args, "-e", env)
-		}
-	}
-
-	args = append(args, cfg.ContainerName(service))
-	args = append(args, command...)
-
-	return RunWSLCInteractive(ctx, args...)
-}
-
-func Run(ctx context.Context, cfg config.ComposeFile, service string, command []string, opts ...RunOptions) error {
-	var opt RunOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-
-	svc, ok := cfg.Services[service]
-	if !ok {
-		return fmt.Errorf("service %q not found in compose file", service)
-	}
-
-	if svc.Image == "" && svc.Build.IsZero() {
-		return fmt.Errorf("service %q has neither image nor build specified", service)
-	}
-
-	networkNames := managedNetworkNames(cfg.Networks)
-	volumeNames := managedVolumeNames(cfg.Volumes)
-
-	if err := createManagedNetworks(ctx, cfg, networkNames, nil, nil); err != nil {
-		return err
-	}
-	if err := createManagedVolumes(ctx, cfg, volumeNames, nil, nil); err != nil {
-		return err
-	}
-
-	if !opt.NoDeps && len(svc.DependsOn) > 0 {
-		deps := svc.DependsOn.SortedNames()
-		if err := Up(ctx, cfg, UpOptions{
-			Detach:     true,
-			NoRecreate: true,
-			Services:   deps,
-		}); err != nil {
-			return err
-		}
-	}
-
-	puller := newImagePuller()
-	image, err := prepareServiceImage(ctx, cfg, service, svc, UpOptions{}, "svc:"+service, nil, puller)
-	if err != nil {
-		return err
-	}
-
-	oneOffName := fmt.Sprintf("%s-%s-run-%s", cfg.ProjectName(), service, randomHex(4))
-	overrides := containerRunOverrides{
-		Detach:        opt.Detach,
-		AutoRemove:    opt.Remove,
-		Interactive:   !opt.Detach,
-		AllocateTTY:   !opt.Detach && isStdinTTY(),
-		SkipPorts:     true,
-		Workdir:       opt.Workdir,
-		User:          opt.User,
-		Entrypoint:    opt.Entrypoint,
-		HasEntrypoint: opt.HasEntrypoint,
-		Env:           opt.Env,
-		Command:       command,
-		HasCommand:    len(command) > 0,
-	}
-
-	attachments := resolveNetworkAttachments(cfg, service, svc)
-	if len(attachments) <= 1 {
-		args := buildContainerRunArgs(cfg, service, oneOffName, svc, image, overrides)
-		if opt.Detach {
-			out, runErr := RunWSLC(ctx, args...)
-			if runErr != nil {
-				return fmt.Errorf("failed to run service %q: %w", service, runErr)
-			}
-			if out != "" {
-				fmt.Fprintln(os.Stdout, out)
-			} else {
-				fmt.Fprintln(os.Stdout, oneOffName)
-			}
-			return nil
-		}
-		return RunWSLCInteractive(ctx, args...)
-	}
-
-	createArgs := buildContainerCreateArgs(cfg, service, oneOffName, svc, image, &attachments[0], overrides)
-	res, createErr := RunWSLC(ctx, createArgs...)
-	if createErr != nil {
-		return fmt.Errorf("failed to create container for service %q: %w", service, createErr)
-	}
-
-	target := strings.TrimSpace(res)
-	if target == "" {
-		target = oneOffName
-	}
-
-	if opt.Remove {
-		defer func() {
-			_ = StopAndRemoveContainer(context.Background(), target)
-		}()
-	}
-
-	for _, att := range attachments[1:] {
-		if err := ConnectNetwork(ctx, att, target); err != nil {
-			if !opt.Remove {
-				_ = StopAndRemoveContainer(context.Background(), target)
-			}
-			return err
-		}
-	}
-
-	if opt.Detach {
-		if err := StartExistingContainer(ctx, target); err != nil {
-			if !opt.Remove {
-				_ = StopAndRemoveContainer(context.Background(), target)
-			}
-			return err
-		}
-		fmt.Fprintln(os.Stdout, target)
-		return nil
-	}
-
-	return RunWSLCInteractive(ctx, "start", "-a", "-i", target)
 }
 
 func Config(cfg config.ComposeFile, opts ...ConfigOptions) error {
@@ -495,6 +248,8 @@ func Config(cfg config.ComposeFile, opts ...ConfigOptions) error {
 		return nil
 	}
 
+	out := stdout()
+
 	if opt.Services {
 		names := make([]string, 0, len(cfg.Services))
 		for name := range cfg.Services {
@@ -502,7 +257,7 @@ func Config(cfg config.ComposeFile, opts ...ConfigOptions) error {
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			fmt.Fprintln(os.Stdout, name)
+			fmt.Fprintln(out, name)
 		}
 		return nil
 	}
@@ -514,7 +269,7 @@ func Config(cfg config.ComposeFile, opts ...ConfigOptions) error {
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			fmt.Fprintln(os.Stdout, name)
+			fmt.Fprintln(out, name)
 		}
 		return nil
 	}
@@ -523,7 +278,7 @@ func Config(cfg config.ComposeFile, opts ...ConfigOptions) error {
 	if err != nil {
 		return fmt.Errorf("failed to render compose configuration: %w", err)
 	}
-	_, err = os.Stdout.Write(raw)
+	_, err = out.Write(raw)
 	return err
 }
 
@@ -574,8 +329,9 @@ func Rm(ctx context.Context, cfg config.ComposeFile, targetServices []string, op
 		})
 	}
 
+	out := stdout()
 	if len(targets) == 0 {
-		fmt.Fprintln(os.Stdout, "No stopped containers")
+		fmt.Fprintln(out, "No stopped containers")
 		return nil
 	}
 
@@ -584,7 +340,7 @@ func Rm(ctx context.Context, cfg config.ComposeFile, targetServices []string, op
 		for _, t := range targets {
 			containerNames = append(containerNames, t.containerName)
 		}
-		fmt.Fprintf(os.Stdout, "Going to remove %s\nAre you sure? [yN] ", strings.Join(containerNames, ", "))
+		fmt.Fprintf(out, "Going to remove %s\nAre you sure? [yN] ", strings.Join(containerNames, ", "))
 		reader := bufio.NewReader(os.Stdin)
 		answer, _ := reader.ReadString('\n')
 		answer = strings.ToLower(strings.TrimSpace(answer))
@@ -666,6 +422,8 @@ func Images(ctx context.Context, cfg config.ComposeFile, targetServices []string
 		return ImageInfo{}, false
 	}
 
+	out := stdout()
+
 	if opt.Quiet {
 		seen := make(map[string]bool)
 		for _, name := range names {
@@ -679,7 +437,7 @@ func Images(ctx context.Context, cfg config.ComposeFile, targetServices []string
 				continue
 			}
 			seen[id] = true
-			fmt.Fprintln(os.Stdout, id)
+			fmt.Fprintln(out, id)
 		}
 		return nil
 	}
@@ -708,7 +466,7 @@ func Images(ctx context.Context, cfg config.ComposeFile, targetServices []string
 		rows = append(rows, []string{cfg.ContainerName(name), repo, tag, imgID, size})
 	}
 
-	printTable(os.Stdout, []string{"CONTAINER", "REPOSITORY", "TAG", "IMAGE ID", "SIZE"}, rows)
+	printTable(out, []string{"CONTAINER", "REPOSITORY", "TAG", "IMAGE ID", "SIZE"}, rows)
 	return nil
 }
 
@@ -774,12 +532,4 @@ func removeOrphanContainers(ctx context.Context, orphans []ContainerInfo, ui *pr
 		}()
 	}
 	wg.Wait()
-}
-
-func randomHex(n int) string {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "00000000"
-	}
-	return hex.EncodeToString(b)
 }

@@ -215,3 +215,180 @@ volumes:
 		t.Fatalf("expected debug service to be included when explicitly requested")
 	}
 }
+
+func TestVolumeDriverOptsLabelsAndInterpolation(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+	envContent := "VOL_DRIVER=local\nVOL_NAME=custom_pg_data\nNFS_DEVICE=:/srv/data\nENV_TIER=staging\nLABEL_OWNER=platform\n"
+	if err := os.WriteFile(envPath, []byte(envContent), 0644); err != nil {
+		t.Fatalf("failed to write .env: %v", err)
+	}
+
+	composeYAML := `
+name: voltest
+services:
+  app:
+    image: alpine:latest
+volumes:
+  nfs_data:
+    driver: ${VOL_DRIVER}
+    name: ${VOL_NAME}
+    driver_opts:
+      type: nfs
+      o: addr=10.0.0.1,rw
+      device: ${NFS_DEVICE}
+    labels:
+      com.example.tier: ${ENV_TIER}
+      com.example.owner: ${LABEL_OWNER}
+  list_labels_vol:
+    driver: local
+    labels:
+      - app=backend
+      - env=${ENV_TIER}
+      - bare_flag
+  default_vol:
+  vhd_vol:
+    driver: vhd
+  ext_vol:
+    external: true
+  ext_named:
+    external: true
+    name: existing_shared_vol
+`
+	composePath := filepath.Join(dir, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte(composeYAML), 0644); err != nil {
+		t.Fatalf("failed to write compose.yaml: %v", err)
+	}
+
+	cfg, err := Load(composePath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	nfsVol, ok := cfg.Volumes["nfs_data"]
+	if !ok {
+		t.Fatalf("expected nfs_data volume to be loaded")
+	}
+	if nfsVol.Driver != "local" {
+		t.Fatalf("expected interpolated driver 'local', got %q", nfsVol.Driver)
+	}
+	if nfsVol.Name != "custom_pg_data" || cfg.VolumeName("nfs_data") != "custom_pg_data" {
+		t.Fatalf("expected interpolated volume name 'custom_pg_data', got field=%q resolved=%q", nfsVol.Name, cfg.VolumeName("nfs_data"))
+	}
+	wantDriverOpts := map[string]string{
+		"type":   "nfs",
+		"o":      "addr=10.0.0.1,rw",
+		"device": ":/srv/data",
+	}
+	if !reflect.DeepEqual(nfsVol.DriverOpts, wantDriverOpts) {
+		t.Fatalf("got driver_opts %#v, want %#v", nfsVol.DriverOpts, wantDriverOpts)
+	}
+	wantMapLabels := LabelMap{
+		"com.example.tier":  "staging",
+		"com.example.owner": "platform",
+	}
+	if !reflect.DeepEqual(nfsVol.Labels, wantMapLabels) {
+		t.Fatalf("got map labels %#v, want %#v", nfsVol.Labels, wantMapLabels)
+	}
+
+	listVol, ok := cfg.Volumes["list_labels_vol"]
+	if !ok {
+		t.Fatalf("expected list_labels_vol volume to be loaded")
+	}
+	if cfg.VolumeName("list_labels_vol") != "voltest_list_labels_vol" {
+		t.Fatalf("expected project-prefixed volume name 'voltest_list_labels_vol', got %q", cfg.VolumeName("list_labels_vol"))
+	}
+	wantListLabels := LabelMap{
+		"app":       "backend",
+		"env":       "staging",
+		"bare_flag": "",
+	}
+	if !reflect.DeepEqual(listVol.Labels, wantListLabels) {
+		t.Fatalf("got list labels %#v, want %#v", listVol.Labels, wantListLabels)
+	}
+
+	if cfg.VolumeName("default_vol") != "voltest_default_vol" {
+		t.Fatalf("expected project-prefixed default_vol name 'voltest_default_vol', got %q", cfg.VolumeName("default_vol"))
+	}
+	if cfg.Volumes["default_vol"].Driver != "" {
+		t.Fatalf("expected omitted volume driver to remain empty, got %q", cfg.Volumes["default_vol"].Driver)
+	}
+	if cfg.Volumes["vhd_vol"].Driver != "vhd" {
+		t.Fatalf("expected vhd_vol driver 'vhd', got %q", cfg.Volumes["vhd_vol"].Driver)
+	}
+	if !cfg.Volumes["ext_vol"].External || cfg.VolumeName("ext_vol") != "ext_vol" {
+		t.Fatalf("expected external volume ext_vol to preserve raw name, got external=%v name=%q", cfg.Volumes["ext_vol"].External, cfg.VolumeName("ext_vol"))
+	}
+	if !cfg.Volumes["ext_named"].External || cfg.VolumeName("ext_named") != "existing_shared_vol" {
+		t.Fatalf("expected external named volume to resolve to existing_shared_vol, got external=%v name=%q", cfg.Volumes["ext_named"].External, cfg.VolumeName("ext_named"))
+	}
+}
+
+func TestBaseDirEnvFileAndBindMountResolution(t *testing.T) {
+	root := t.TempDir()
+	subDir := filepath.Join(root, "other-folder")
+	if err := os.MkdirAll(filepath.Join(subDir, "nginx"), 0755); err != nil {
+		t.Fatalf("failed to create nested dirs: %v", err)
+	}
+
+	composeYAML := `
+name: nestedapp
+services:
+  single:
+    image: alpine:latest
+    env_file: .env.single
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - db_data:/var/lib/data
+  multi:
+    image: alpine:latest
+    env_file:
+      - .env.first
+      - sub/.env.second
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+volumes:
+  db_data:
+`
+	composePath := filepath.Join(subDir, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte(composeYAML), 0644); err != nil {
+		t.Fatalf("failed to write compose.yaml: %v", err)
+	}
+
+	cfg, err := Load(composePath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if cfg.BaseDir != subDir {
+		t.Fatalf("expected BaseDir %q, got %q", subDir, cfg.BaseDir)
+	}
+
+	single := cfg.Services["single"]
+	wantSingleEnv := StringList{filepath.Join(subDir, ".env.single")}
+	if !reflect.DeepEqual(single.EnvFile, wantSingleEnv) {
+		t.Fatalf("expected single env_file %v, got %v", wantSingleEnv, single.EnvFile)
+	}
+	wantConfSource := filepath.Join(subDir, "nginx", "default.conf")
+	if len(single.Volumes) != 2 || single.Volumes[0].Source != wantConfSource || single.Volumes[0].Type != "bind" {
+		t.Fatalf("expected short bind source %q, got %+v", wantConfSource, single.Volumes)
+	}
+	if single.Volumes[1].Source != "db_data" || single.Volumes[1].Type != "volume" {
+		t.Fatalf("expected named volume source 'db_data' unchanged, got %+v", single.Volumes[1])
+	}
+
+	multi := cfg.Services["multi"]
+	wantMultiEnv := StringList{
+		filepath.Join(subDir, ".env.first"),
+		filepath.Join(subDir, "sub", ".env.second"),
+	}
+	if !reflect.DeepEqual(multi.EnvFile, wantMultiEnv) {
+		t.Fatalf("expected multi env_file %v, got %v", wantMultiEnv, multi.EnvFile)
+	}
+	wantDataSource := filepath.Join(subDir, "data")
+	if len(multi.Volumes) != 1 || multi.Volumes[0].Source != wantDataSource || multi.Volumes[0].Type != "bind" {
+		t.Fatalf("expected long bind source %q, got %+v", wantDataSource, multi.Volumes)
+	}
+}

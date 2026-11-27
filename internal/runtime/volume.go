@@ -21,16 +21,23 @@ func CreateVolume(ctx context.Context, name string, vol config.Volume) (string, 
 	return res, err
 }
 
-func createVolume(ctx context.Context, name string, vol config.Volume) (string, bool, error) {
-	target := ResolveVolumeName(name, vol)
-	if vol.External {
-		return target, false, nil
-	}
-
+func buildVolumeCreateArgs(target string, vol config.Volume) []string {
 	args := []string{"volume", "create"}
 
-	if vol.Driver != "" && vol.Driver != "local" {
-		args = append(args, "--driver", vol.Driver)
+	driver := strings.TrimSpace(vol.Driver)
+	if driver != "" && !strings.EqualFold(driver, "local") {
+		args = append(args, "-d", driver)
+	}
+
+	if len(vol.DriverOpts) > 0 {
+		keys := make([]string, 0, len(vol.DriverOpts))
+		for k := range vol.DriverOpts {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			args = append(args, "-o", fmt.Sprintf("%s=%s", k, vol.DriverOpts[k]))
+		}
 	}
 
 	if len(vol.Labels) > 0 {
@@ -40,11 +47,21 @@ func createVolume(ctx context.Context, name string, vol config.Volume) (string, 
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			args = append(args, "--label", fmt.Sprintf("%s=%s", k, vol.Labels[k]))
+			args = append(args, "-l", fmt.Sprintf("%s=%s", k, vol.Labels[k]))
 		}
 	}
 
 	args = append(args, target)
+	return args
+}
+
+func createVolume(ctx context.Context, name string, vol config.Volume) (string, bool, error) {
+	target := ResolveVolumeName(name, vol)
+	if vol.External {
+		return target, false, nil
+	}
+
+	args := buildVolumeCreateArgs(target, vol)
 
 	res, err := RunWSLC(ctx, args...)
 	if err != nil {

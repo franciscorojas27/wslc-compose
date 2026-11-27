@@ -6,7 +6,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var buildNoCache bool
+var (
+	buildNoCache bool
+	buildPull    bool
+	buildArgs    []string
+)
 
 var buildCmd = &cobra.Command{
 	Use:   "build [service...]",
@@ -18,12 +22,16 @@ var buildCmd = &cobra.Command{
 		}
 		return runtime.Build(cmd.Context(), cfg, args, runtime.BuildOptions{
 			NoCache:    buildNoCache,
-			ProjectDir: cfg.ProjectDir,
+			Pull:       buildPull,
+			BuildArgs:  buildArgs,
+			ProjectDir: cfg.ComposeBaseDir(),
 		})
 	},
 }
 
 func init() {
 	buildCmd.Flags().BoolVar(&buildNoCache, "no-cache", false, "Do not use cache when building the image")
+	buildCmd.Flags().BoolVar(&buildPull, "pull", false, "Always attempt to pull a newer version of the image")
+	buildCmd.Flags().StringArrayVar(&buildArgs, "build-arg", nil, "Set build-time variables for services")
 	rootCmd.AddCommand(buildCmd)
 }
